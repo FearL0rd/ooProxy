@@ -27,6 +27,13 @@ SPEC = ModuleSpec(
             metavar="KEY",
         ),
         OptionSpec(
+            flags=("--host",),
+            dest="host",
+            help="Local IP address to listen on (default: 127.0.0.1)",
+            metavar="HOST",
+            default="127.0.0.1",
+        ),
+        OptionSpec(
             flags=("--port",),
             dest="port",
             help="Local port to listen on (default: 11434)",
@@ -36,6 +43,7 @@ SPEC = ModuleSpec(
     ),
     usage_examples=(
         "ooproxy.py -s --url https://integrate.api.nvidia.com/v1 --key nvapi-xxx",
+        "ooproxy.py -s --host 0.0.0.0 --port 8080",
         "OPENAI_BASE_URL=https://... OPENAI_API_KEY=sk-... ooproxy.py -s",
     ),
 )
@@ -68,8 +76,9 @@ def run(args) -> ResultEnvelope:
     uv_log_level = _configure_logging(debug, verbose)
     config = ProxyConfig.from_args(args)
     app = create_app(config)
+    host = getattr(args, "host", "127.0.0.1")
     try:
-        uvicorn.run(app, host="127.0.0.1", port=config.port, log_level=uv_log_level)
+        uvicorn.run(app, host=host, port=config.port, log_level=uv_log_level)
     except KeyboardInterrupt:
         pass
     return command_result("serve", None, data=None)
