@@ -1,20 +1,24 @@
 import requests
-import json
+import argparse
 from typing import List, Dict
 
-def list_ollama_models() -> List[Dict]:
+def list_ollama_models(base_url: str, use_openai: bool) -> List[Dict]:
     """
-    Fetch and return the list of models from a local Ollama instance.
+    Fetch and return the list of models from an Ollama-compatible instance.
     """
-    url = "http://localhost:11434/api/tags"
+    url = f"{base_url}/v1/models" if use_openai else f"{base_url}/api/tags"
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status() # Raise error for bad status codes
+        response.raise_for_status()  # Raise error for bad status codes
         data = response.json()
-        models = data.get("models", [])
+        if use_openai:
+            # OpenAI-compatible responses usually return models in the "data" field.
+            models = [{"name": item.get("id", "Unknown")} for item in data.get("data", [])]
+        else:
+            models = data.get("models", [])
         return models
     except requests.exceptions.ConnectionError:
-        print("❌ Could not connect to Ollama. Is it running on http://localhost:11434?")
+        print(f"❌ Could not connect to server at {base_url}. Is it running?")
         return []
     except requests.exceptions.Timeout:
         print("❌ Request timed out. Ollama might be slow or unresponsive.")
@@ -24,8 +28,17 @@ def list_ollama_models() -> List[Dict]:
         return []
 
 def main():
-    print("🔍 Fetching models from local Ollama...\n")
-    models = list_ollama_models()
+    parser = argparse.ArgumentParser(description="List available models from an Ollama-compatible server.")
+    parser.add_argument("model", nargs="?", default="", help="Ignored (kept for CLI compatibility with ollama_chat.py)")
+    parser.add_argument("-o", "--openai", action="store_true", help="Use OpenAI compatible API endpoint")
+    parser.add_argument("-i", "--ip", default="localhost", help="IP address of the Ollama server (default: localhost)")
+    parser.add_argument("-p", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
+    args = parser.parse_args()
+
+    base_url = f"http://{args.ip}:{args.port}"
+
+    print(f"🔍 Fetching models from {base_url}...\n")
+    models = list_ollama_models(base_url, args.openai)
 
     if not models:
         print("No models found or could not connect to Ollama.")
