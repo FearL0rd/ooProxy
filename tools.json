@@ -1,0 +1,84 @@
+{
+  "tools": [
+    {
+      "name": "git_status",
+      "description": "Return git status for the current repository.",
+      "read_only": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "command": "git status --short"
+    },
+    {
+      "name": "list_tmp",
+      "description": "List entries in /tmp using a shell command.",
+      "read_only": true,
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "command": "ls -la /tmp"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "echo_args_python",
+        "description": "Echo the JSON tool arguments back using a small Python one-liner.",
+        "read_only": true,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string",
+              "description": "A string value to echo back."
+            },
+            "count": {
+              "type": "integer",
+              "description": "An optional integer to include in the response."
+            }
+          },
+          "required": ["value"]
+        },
+        "argv": [
+          "python3",
+          "-c",
+          "import json,sys; data=json.load(sys.stdin); print(json.dumps({'received': data}, indent=2))"
+        ],
+        "cwd": "."
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "show_file_head",
+        "description": "Print the first N lines of a file.",
+        "read_only": true,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to the file to preview."
+            },
+            "lines": {
+              "type": "integer",
+              "description": "Number of lines to print.",
+              "default": 20
+            }
+          },
+          "required": ["path"]
+        },
+        "argv": [
+          "python3",
+          "-c",
+          "import json,sys,pathlib; data=json.load(sys.stdin); path=pathlib.Path(data['path']); lines=int(data.get('lines',20)); print(''.join(path.read_text(encoding='utf-8').splitlines(True)[:lines]))"
+        ],
+        "cwd": ".",
+        "timeout": 30
+      }
+    }
+  ]
+}

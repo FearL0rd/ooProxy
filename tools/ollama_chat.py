@@ -21,6 +21,7 @@ DEFAULT_TOOL_TIMEOUT = 120
 MAX_TOOL_OUTPUT_CHARS = 16000
 EXTERNAL_TOOL_FILES: List[str] = []
 DEFAULT_RENDER_MODE = "markdown"
+DEFAULT_GUARDRAILS_MODE = "confirm-destructive"
 
 # Optional rich-based Markdown renderer for prettier terminal output
 try:
@@ -131,6 +132,7 @@ def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
     return {
         "get_current_directory": {
             "description": "Return the current working directory for this chat session.",
+            "read_only": True,
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -140,6 +142,7 @@ def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
         },
         "list_directory": {
             "description": "List files and folders in a directory.",
+            "read_only": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -154,6 +157,7 @@ def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
         },
         "read_file": {
             "description": "Read a UTF-8 text file from disk.",
+            "read_only": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -168,6 +172,8 @@ def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
         },
         "write_file": {
             "description": "Write UTF-8 text to a file, replacing existing contents.",
+            "read_only": False,
+            "confirm_on_overwrite": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -186,6 +192,8 @@ def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
         },
         "run_shell": {
             "description": "Run a shell command in the current working directory and return stdout, stderr, and exit code.",
+            "read_only": False,
+            "shell_command": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -289,6 +297,9 @@ def _normalize_external_tool_definition(raw_tool: Dict[str, Any], tool_file: str
         "description": function.get("description", "External command-backed tool."),
         "parameters": parameters,
         "source": tool_file,
+        "read_only": bool(function.get("read_only", False)),
+        "destructive": bool(function.get("destructive", False)),
+        "shell_command": bool(function.get("command")),
         "handler": _tool_command_handler_factory(name, {
             "command": function.get("command"),
             "argv": function.get("argv"),
@@ -384,10 +395,90 @@ def _tool_error_message(error: Exception) -> str:
     })
 
 
-def execute_tool_call(name: str, arguments: Dict[str, Any]) -> str:
+def _tool_denied_message(reason: str) -> str:
+    return _json_result({
+        "ok": False,
+        "error": "GuardrailDenied",
+        "message": reason,
+    })
+
+
+def _command_looks_destructive(command: str) -> bool:
+    lower = f" {command.lower()} "
+    destructive_tokens = [
+        " rm ",
+        " rmdir ",
+        " unlink ",
+        " mv ",
+        " dd ",
+        " truncate ",
+        " shred ",
+        " chmod ",
+        " chown ",
+        " sed -i",
+        " perl -pi",
+        " git clean ",
+        " git reset ",
+        " git checkout ",
+        " git restore ",
+        " find ",
+    ]
+    if any(token in lower for token in destructive_tokens):
+        return True
+    if "find " in lower and " -delete" in lower:
+        return True
+    if ">" in command or ">>" in command:
+        return True
+    if " tee " in lower:
+        return True
+    return False
+
+
+def _tool_guardrail_reason(name: str, arguments: Dict[str, Any], spec: Dict[str, Any]) -> Optional[str]:
+    if spec.get("confirm_on_overwrite"):
+        path = arguments.get("path")
+        if isinstance(path, str) and path:
+            target = os.path.abspath(path)
+            if os.path.exists(target):
+                return f"Tool '{name}' would overwrite existing path: {target}"
+
+    if spec.get("shell_command"):
+        command = arguments.get("command")
+        if isinstance(command, str) and _command_looks_destructive(command):
+            return f"Tool '{name}' wants to run a potentially destructive shell command: {command}"
+
+    if spec.get("destructive"):
+        return f"Tool '{name}' is marked destructive."
+
+    if spec.get("source") and not spec.get("read_only", False):
+        return f"External tool '{name}' is not marked read-only."
+
+    return None
+
+
+def _confirm_tool_execution(name: str, arguments: Dict[str, Any], reason: str) -> bool:
+    print(f"⚠️ Guardrail: {reason}")
+    print(f"⚠️ Requested call: {_tool_summary({'name': name, 'arguments': arguments})}")
+    try:
+        answer = input("Allow? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def execute_tool_call(name: str, arguments: Dict[str, Any], guardrails_mode: str) -> str:
     spec = TOOL_REGISTRY.get(name)
     if not spec:
         raise KeyError(f"Unknown tool: {name}")
+
+    reason = _tool_guardrail_reason(name, arguments, spec)
+    if guardrails_mode == "read-only":
+        if not spec.get("read_only", False) or reason:
+            return _tool_denied_message(reason or f"Tool '{name}' is not allowed in read-only mode.")
+    elif guardrails_mode == "confirm-destructive" and reason:
+        if not _confirm_tool_execution(name, arguments, reason):
+            return _tool_denied_message(f"User denied execution of tool '{name}'.")
+
     handler: ToolHandler = spec["handler"]
     return handler(**arguments)
 
@@ -944,7 +1035,7 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
         print(f"❌ Compact failed: {e}")
         return messages
 
-def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: bool, render_mode: str):
+def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: bool, render_mode: str, guardrails_mode: str):
     global ATTACHMENT_BUFFER
 
     # Determine endpoint based on flag
@@ -993,6 +1084,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
         print(" /tools → List available local tools")
         print(" /status → View session information")
         print(f" Render mode: {render_mode}")
+        print(f" Guardrails: {guardrails_mode}")
         print(" Enter → submit | Alt-Enter / Shift-Enter / Ctrl-J → new line\n")
 
     while True:
@@ -1088,7 +1180,8 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 for schema in TOOL_SCHEMAS:
                     function = schema["function"]
                     tool_spec = TOOL_REGISTRY.get(function["name"], {})
-                    print(f" - {function['name']} [{_tool_display_source(tool_spec)}]: {function['description']}")
+                    tool_mode = "read-only" if tool_spec.get("read_only", False) else "guarded"
+                    print(f" - {function['name']} [{_tool_display_source(tool_spec)}, {tool_mode}]: {function['description']}")
                 continue
 
             elif cmd in ['/?', '/help']:
@@ -1142,6 +1235,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 print(f"📎 Attachments: {len(ATTACHMENT_BUFFER)} file(s) pending")
                 print(f"🧰 Local Tools: {'Enabled' if enable_tools else 'Disabled'} ({len(TOOL_SCHEMAS) if enable_tools else 0} available)")
                 print(f"🎨 Render Mode: {render_mode}")
+                print(f"🛡️ Guardrails: {guardrails_mode}")
                 if EXTERNAL_TOOL_FILES:
                     print(f"📦 External Tool Files: {len(EXTERNAL_TOOL_FILES)} loaded")
                 print("-------------------------\n")
@@ -1196,7 +1290,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 for call in normalized_calls:
                     print(f"[tool] { _tool_summary(call) }")
                     try:
-                        result = execute_tool_call(call["name"], call["arguments"])
+                        result = execute_tool_call(call["name"], call["arguments"], guardrails_mode)
                     except Exception as exc:
                         result = _tool_error_message(exc)
                     messages.append(_tool_result_message(call["name"], result, call["id"], use_openai))
@@ -1228,6 +1322,7 @@ def main():
     parser.add_argument("-t", "--tools", action="append", default=[], help="Path to a JSON file defining additional command-backed tools. Can be passed multiple times.")
     parser.add_argument("--no-tools", action="store_true", help="Disable local tool definitions for this session")
     parser.add_argument("--render-mode", choices=["markdown", "stream"], default=DEFAULT_RENDER_MODE, help="How assistant replies are shown: buffered markdown view or live raw stream.")
+    parser.add_argument("--guardrails", choices=["confirm-destructive", "read-only", "off"], default=DEFAULT_GUARDRAILS_MODE, help="How destructive tool calls are handled.")
     args = parser.parse_args()
 
     configure_tool_registry(args.tools)
@@ -1272,7 +1367,14 @@ def main():
         except Exception as e:
             print(f"⚠️ Could not remove history file: {e}")
 
-    chat_with_ollama(args.model, base_url, args.openai, enable_tools=not args.no_tools, render_mode=args.render_mode)
+    chat_with_ollama(
+        args.model,
+        base_url,
+        args.openai,
+        enable_tools=not args.no_tools,
+        render_mode=args.render_mode,
+        guardrails_mode=args.guardrails,
+    )
 
 if __name__ == "__main__":
     main()

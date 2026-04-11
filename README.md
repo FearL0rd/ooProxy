@@ -149,6 +149,21 @@ Example tool file:
 
 Command-backed tools receive the tool arguments on stdin as a JSON object and in the `OLLAMA_TOOL_ARGS` environment variable.
 
+Built-in guardrails are enabled by default in `tools/ollama_chat.py` with `--guardrails confirm-destructive`.
+
+- Read-only built-in tools run automatically.
+- `write_file` asks for confirmation before overwriting an existing path.
+- `run_shell` asks for confirmation on commands that look destructive.
+- External tools are treated as guarded unless they explicitly set `"read_only": true`.
+
+Available guardrail modes:
+
+```bash
+python tools/ollama_chat.py openai/gpt-oss-120b --guardrails confirm-destructive
+python tools/ollama_chat.py openai/gpt-oss-120b --guardrails read-only
+python tools/ollama_chat.py openai/gpt-oss-120b --guardrails off
+```
+
 ### ollama_chat regression test
 
 There is also an end-to-end regression script for the interactive tool-calling flow:
