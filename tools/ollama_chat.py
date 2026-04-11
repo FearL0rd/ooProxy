@@ -3,8 +3,13 @@ import json
 import os
 import argparse
 from typing import List, Dict
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.key_binding import KeyBindings
 
-CONTEXT_FILE = "context.txt"
+CONTEXT_FILE = ".ollama_chat_context"
+HISTORY_FILE = ".ollama_chat_history"
 ATTACHMENT_BUFFER: List[Dict] = []
 
 def load_context() -> List[Dict]:
@@ -13,16 +18,16 @@ def load_context() -> List[Dict]:
     try:
         with open(CONTEXT_FILE, "r", encoding="utf-8") as f:
             messages = json.load(f)
-            if messages:
-                print(f"📂 Loaded {len(messages)//2} previous messages.\n")
-                print("📜 Previous conversation:")
-                print("=" * 60)
-                for msg in messages:
-                    role = "You" if msg["role"] == "user" else "Ollama"
-                    print(f"{role}: {msg['content']}\n")
-                print("=" * 60)
-                print("Continuing conversation...\n")
-            return messages
+        if messages:
+            print(f"📂 Loaded {len(messages)//2} previous messages.\n")
+            print("📜 Previous conversation:")
+            print("=" * 60)
+            for msg in messages:
+                role = "You" if msg["role"] == "user" else "Ollama"
+                print(f"{role}: {msg['content']}\n")
+            print("=" * 60)
+            print("Continuing conversation...\n")
+        return messages
     except Exception as e:
         print(f"⚠️ Could not load context: {e}")
         return []
@@ -34,7 +39,7 @@ def save_context(messages: List[Dict]) -> int:
         if not messages:
             if os.path.exists(CONTEXT_FILE):
                 os.remove(CONTEXT_FILE)
-            return -1  # Indicates file was removed
+            return -1 # Indicates file was removed
         with open(CONTEXT_FILE, "w", encoding="utf-8") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
         return len(messages)
@@ -57,6 +62,25 @@ def read_file_content(filepath: str) -> str:
         print(f"❌ Error reading file {filepath}: {e}")
         return None
 
+def get_available_models(base_url: str) -> List[str]:
+    """Fetch list of models from Ollama server."""
+    try:
+        # Native Ollama endpoint for listing models
+        response = requests.get(f"{base_url}/api/tags", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return [m['name'] for m in data.get('models', [])]
+        
+        # Fallback for OpenAI compatible endpoints (often at /v1/models)
+        response = requests.get(f"{base_url}/v1/models", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return [m['id'] for m in data.get('data', [])]
+            
+    except Exception as e:
+        print(f"⚠️ Could not fetch models: {e}")
+    return []
+
 def compact_context(model: str, messages: List[Dict], base_url: str, use_openai: bool) -> List[Dict]:
     if len(messages) < 4:
         print("Not enough conversation to compact.")
@@ -64,7 +88,6 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
 
     print("🗜️ Compacting conversation...")
     history_text = "\n".join(f"{msg['role'].upper()}: {msg['content']}" for msg in messages)
-
     summary_prompt = (
         "You are an expert summarizer. Condense the entire conversation history "
         "into a clear, concise summary (max 400 words) that retains all important "
@@ -107,19 +130,18 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
                         raw = raw[6:]
                         if raw == '[DONE]':
                             continue
-                    chunk = json.loads(raw)
-                    # Handle OpenAI streaming format
-                    if use_openai:
+                        chunk = json.loads(raw)
                         if chunk.get("choices") and chunk["choices"][0].get("delta"):
                             content = chunk["choices"][0]["delta"].get("content", "")
                             if content:
                                 print(content, end="", flush=True)
                                 full_summary += content
-                    # Handle Native Ollama streaming format
-                    elif "message" in chunk and "content" in chunk["message"]:
-                        content = chunk["message"]["content"]
-                        print(content, end="", flush=True)
-                        full_summary += content
+                    else:
+                        chunk = json.loads(raw)
+                        if "message" in chunk and "content" in chunk["message"]:
+                            content = chunk["message"]["content"]
+                            print(content, end="", flush=True)
+                            full_summary += content
                 except json.JSONDecodeError:
                     continue
         print("\n")
@@ -141,22 +163,50 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
 
     messages: List[Dict] = load_context()
 
+    # Key bindings: Enter submits, Alt-Enter / Shift-Enter / Ctrl-J insert newline
+    kb = KeyBindings()
+
+    @kb.add('enter')
+    def _submit(event):
+        event.current_buffer.validate_and_handle()
+
+    @kb.add('escape', 'enter')  # Alt-Enter
+    def _newline_alt(event):
+        event.current_buffer.insert_text('\n')
+
+    @kb.add('c-j')  # Ctrl-J universal fallback
+    def _newline_ctrl(event):
+        event.current_buffer.insert_text('\n')
+
+    session = PromptSession(
+        history=FileHistory(HISTORY_FILE),
+        auto_suggest=AutoSuggestFromHistory(),
+        multiline=True,
+        key_bindings=kb,
+        prompt_continuation=lambda width, line_number, wrap_count: '... ',
+    )
+
     print(f"🤖 Chat with **{model}** started")
     print("Available commands:")
     print(" /exit, /quit, /bye → Save and exit")
     print(" /reset → Clear all context")
     print(" /compact → Summarize and shorten history")
+    print(" /model [name] → Switch model (no name lists available models)")
     print(" /file <filename> → Add file to next message")
-    print(" /clearfiles → Clear attachment buffer\n")
+    print(" /clearfiles → Clear attachment buffer")
+    print(" /status → View session information")
+    print(" Enter → submit | Alt-Enter / Shift-Enter / Ctrl-J → new line\n")
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = session.prompt("You: ").strip()
             if not user_input:
                 continue
 
             # Handle commands
-            cmd = user_input.lower().split()[0]
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+
             if cmd in ['/exit', '/quit', '/bye']:
                 saved_count = save_context(messages)
                 if saved_count == -1:
@@ -166,6 +216,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
                 else:
                     print("⚠️ Context could not be saved. Goodbye!")
                 break
+
             elif cmd == '/reset':
                 messages = []
                 if os.path.exists(CONTEXT_FILE):
@@ -173,24 +224,75 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
                 ATTACHMENT_BUFFER.clear()
                 print("🗑️ Conversation fully reset.\n")
                 continue
+
             elif cmd == '/compact':
                 messages = compact_context(model, messages, base_url, use_openai)
                 save_context(messages)
                 continue
+
+            elif cmd == '/model':
+                # If no argument, list models
+                if len(parts) < 2:
+                    print(f"🔍 Fetching available models from {base_url}...")
+                    models = get_available_models(base_url)
+                    if models:
+                        print(f"📋 Available models ({len(models)}):")
+                        # Print in 4 columns
+                        # Determine max width for columns
+                        max_len = max(len(m) for m in models) + 4
+                        cols = 2
+                        for i in range(0, len(models), cols):
+                            row = models[i:i+cols]
+                            # Pad each item to align columns
+                            print("  " + "".join(item.ljust(max_len) for item in row))
+                        print(f"\nCurrent model: {model}")
+                        print("Usage: /model <name>")
+                    else:
+                        print("⚠️ No models found or failed to retrieve list.")
+                    continue
+                
+                # If argument provided, switch model
+                new_model = parts[1].strip()
+                model = new_model
+                print(f"🔄 Model switched to: {model}")
+                continue
+
             elif cmd == '/file':
-                if len(user_input.split()) < 2:
+                if len(parts) < 2:
                     print("Usage: /file <filename>")
                     continue
-                filepath = user_input.split(maxsplit=1)[1].strip()
+                filepath = parts[1].strip()
                 content = read_file_content(filepath)
                 if content:
                     ATTACHMENT_BUFFER.append(content)
                     filename = os.path.basename(filepath)
                     print(f"✅ Added to attachments: {filename} ({len(content)} characters)")
                 continue
+
             elif cmd == '/clearfiles':
                 ATTACHMENT_BUFFER.clear()
                 print("🧹 Attachment buffer cleared.")
+                continue
+
+            elif cmd == '/status':
+                print("\n--- 📊 Session Status ---")
+                print(f"🤖 Active Model: {model}")
+                print(f"🌐 API Endpoint: {base_url}")
+                print(f"🔌 API Mode: {'OpenAI Compatible' if use_openai else 'Native Ollama'}")
+                print(f"📂 Context File: {CONTEXT_FILE}")
+
+                # Calculate context size
+                ctx_len = len(messages)
+                ctx_chars = sum(len(m.get('content', '')) for m in messages)
+                print(f"💬 Context Size: {ctx_len} messages ({ctx_chars:,} chars)")
+
+                # Check file status
+                file_exists = "Yes" if os.path.exists(CONTEXT_FILE) else "No"
+                print(f"💾 File Saved: {file_exists}")
+
+                # Attachment buffer status
+                print(f"📎 Attachments: {len(ATTACHMENT_BUFFER)} file(s) pending")
+                print("-------------------------\n")
                 continue
 
             # Normal message - attach files if any
@@ -203,6 +305,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
             messages.append({"role": "user", "content": full_user_message})
 
             print("Ollama: ", end="", flush=True)
+
             payload = {
                 "model": model,
                 "messages": messages,
@@ -223,24 +326,28 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
                             raw = raw[6:]
                             if raw == '[DONE]':
                                 continue
-                        chunk = json.loads(raw)
-                        # Parse OpenAI format
-                        if use_openai:
+                            chunk = json.loads(raw)
                             if chunk.get("choices"):
                                 delta = chunk["choices"][0].get("delta", {})
                                 content = delta.get("content", "")
                                 if content:
                                     print(content, end="", flush=True)
                                     full_response += content
-                        # Parse Native Ollama format
-                        elif "message" in chunk and "content" in chunk["message"]:
-                            content = chunk["message"]["content"]
-                            print(content, end="", flush=True)
-                            full_response += content
+                            # Fallback: server responded in native Ollama format despite -o
+                            elif "message" in chunk and "content" in chunk["message"]:
+                                content = chunk["message"]["content"]
+                                print(content, end="", flush=True)
+                                full_response += content
+                        else:
+                            chunk = json.loads(raw)
+                            if "message" in chunk and "content" in chunk["message"]:
+                                content = chunk["message"]["content"]
+                                print(content, end="", flush=True)
+                                full_response += content
                     except json.JSONDecodeError:
                         continue
-            print()
 
+            print()
             if full_response:
                 messages.append({"role": "assistant", "content": full_response})
 
