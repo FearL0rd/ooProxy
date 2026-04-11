@@ -102,6 +102,71 @@ JSON output:
 python ooproxy.py --list --json
 ```
 
+### ollama_chat tool files
+
+`tools/ollama_chat.py` supports built-in tools plus additional external tools loaded from JSON files with `-t/--tools`.
+
+Example:
+
+```bash
+python tools/ollama_chat.py llama3.1 -t ./toolset.json
+```
+
+Example tool file:
+
+```json
+{
+  "tools": [
+    {
+      "name": "git_status",
+      "description": "Return git status for the current repository.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "command": "git status --short"
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "echo_args",
+        "description": "Echo stdin JSON arguments via Python.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "value": {"type": "string"}
+          },
+          "required": ["value"]
+        },
+        "argv": ["python3", "scripts/echo_tool.py"],
+        "cwd": "."
+      }
+    }
+  ]
+}
+```
+
+Command-backed tools receive the tool arguments on stdin as a JSON object and in the `OLLAMA_TOOL_ARGS` environment variable.
+
+### ollama_chat regression test
+
+There is also an end-to-end regression script for the interactive tool-calling flow:
+
+```bash
+python tools/test_ollama_chat_e2e.py --model openai/gpt-oss-120b
+```
+
+By default it tests both the native `/api/chat` path and the OpenAI-compatible `/v1/chat/completions` path against an already running proxy.
+
+To let the script start and stop its own proxy instance, pass a command such as:
+
+```bash
+python tools/test_ollama_chat_e2e.py \
+  --model openai/gpt-oss-120b \
+  --proxy-command './start.sh'
+```
+
 ---
 
 ## Supported backends

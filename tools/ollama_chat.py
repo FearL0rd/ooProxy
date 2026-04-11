@@ -1,11 +1,13 @@
-import requests
-import json
-import os
 import argparse
 import atexit
-import sys
+import json
+import os
 import signal
-from typing import List, Dict
+import subprocess
+import sys
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -14,7 +16,11 @@ from prompt_toolkit.key_binding import KeyBindings
 CONTEXT_FILE = ".ollama_chat_context"
 HISTORY_FILE = ".ollama_chat_history"
 LOCK_FILE = ".ollama_chat_lock"
-ATTACHMENT_BUFFER: List[Dict] = []
+ATTACHMENT_BUFFER: List[str] = []
+DEFAULT_TOOL_TIMEOUT = 120
+MAX_TOOL_OUTPUT_CHARS = 16000
+EXTERNAL_TOOL_FILES: List[str] = []
+DEFAULT_RENDER_MODE = "markdown"
 
 # Optional rich-based Markdown renderer for prettier terminal output
 try:
@@ -29,7 +35,7 @@ except Exception:
 CONTINUE_SESSION = False
 
 
-def render_markdown_to_terminal(text: str, console: Console = None) -> None:
+def render_markdown_to_terminal(text: str, console: Any = None) -> None:
     """Render Markdown `text` to the terminal using Rich if available,
     otherwise fall back to plain printing.
     """
@@ -43,6 +49,648 @@ def render_markdown_to_terminal(text: str, console: Console = None) -> None:
             pass
     # Fallback
     print(text)
+
+
+def _truncate_text(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n\n...[truncated {omitted} characters]"
+
+
+def _json_result(payload: Any) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _tool_get_cwd() -> str:
+    return _json_result({"cwd": os.getcwd()})
+
+
+def _tool_list_directory(path: str = ".") -> str:
+    target = os.path.abspath(path)
+    if not os.path.exists(target):
+        raise FileNotFoundError(f"Directory does not exist: {path}")
+    if not os.path.isdir(target):
+        raise NotADirectoryError(f"Not a directory: {path}")
+
+    entries = []
+    for name in sorted(os.listdir(target)):
+        full_path = os.path.join(target, name)
+        entries.append({
+            "name": name,
+            "type": "dir" if os.path.isdir(full_path) else "file",
+        })
+
+    return _json_result({"path": target, "entries": entries})
+
+
+def _tool_read_file(path: str) -> str:
+    target = os.path.abspath(path)
+    with open(target, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    return _json_result({
+        "path": target,
+        "content": _truncate_text(content),
+        "truncated": len(content) > MAX_TOOL_OUTPUT_CHARS,
+    })
+
+
+def _tool_write_file(path: str, content: str) -> str:
+    target = os.path.abspath(path)
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return _json_result({"path": target, "written_chars": len(content)})
+
+
+def _tool_run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TOOL_TIMEOUT) -> str:
+    working_directory = os.path.abspath(cwd or os.getcwd())
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=working_directory,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+    return _json_result({
+        "cwd": working_directory,
+        "command": command,
+        "exit_code": result.returncode,
+        "stdout": _truncate_text(result.stdout),
+        "stderr": _truncate_text(result.stderr),
+    })
+
+
+ToolHandler = Callable[..., str]
+
+
+def _build_tool_registry() -> Dict[str, Dict[str, Any]]:
+    return {
+        "get_current_directory": {
+            "description": "Return the current working directory for this chat session.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            "handler": _tool_get_cwd,
+        },
+        "list_directory": {
+            "description": "List files and folders in a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to inspect. Defaults to the current working directory.",
+                    },
+                },
+                "required": [],
+            },
+            "handler": _tool_list_directory,
+        },
+        "read_file": {
+            "description": "Read a UTF-8 text file from disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read.",
+                    },
+                },
+                "required": ["path"],
+            },
+            "handler": _tool_read_file,
+        },
+        "write_file": {
+            "description": "Write UTF-8 text to a file, replacing existing contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to write.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file contents to write.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+            "handler": _tool_write_file,
+        },
+        "run_shell": {
+            "description": "Run a shell command in the current working directory and return stdout, stderr, and exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory. Defaults to the current working directory.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds. Defaults to 120.",
+                    },
+                },
+                "required": ["command"],
+            },
+            "handler": _tool_run_shell,
+        },
+    }
+
+
+def _tool_display_source(spec: Dict[str, Any]) -> str:
+    return spec.get("source", "builtin")
+
+
+def _tool_command_handler_factory(name: str, command_spec: Dict[str, Any]) -> ToolHandler:
+    command = command_spec.get("command")
+    argv = command_spec.get("argv")
+    cwd = command_spec.get("cwd")
+    timeout = int(command_spec.get("timeout", DEFAULT_TOOL_TIMEOUT))
+    if bool(command) == bool(argv):
+        raise ValueError(f"External tool '{name}' must define exactly one of 'command' or 'argv'.")
+
+    def _run_external_tool(**arguments: Any) -> str:
+        input_payload = json.dumps(arguments, ensure_ascii=False)
+        env = os.environ.copy()
+        env["OLLAMA_TOOL_NAME"] = name
+        env["OLLAMA_TOOL_ARGS"] = input_payload
+        working_directory = os.path.abspath(cwd) if cwd else os.getcwd()
+
+        result = subprocess.run(
+            command if command else [str(part) for part in argv],
+            shell=bool(command),
+            cwd=working_directory,
+            input=input_payload,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        if result.returncode != 0:
+            raise RuntimeError(_json_result({
+                "command": command if command else argv,
+                "cwd": working_directory,
+                "exit_code": result.returncode,
+                "stdout": _truncate_text(stdout),
+                "stderr": _truncate_text(stderr),
+            }))
+
+        if stdout:
+            return _truncate_text(stdout)
+        if stderr:
+            return _truncate_text(stderr)
+        return _json_result({
+            "command": command if command else argv,
+            "cwd": working_directory,
+            "exit_code": result.returncode,
+        })
+
+    return _run_external_tool
+
+
+def _normalize_external_tool_definition(raw_tool: Dict[str, Any], tool_file: str) -> Dict[str, Any]:
+    function = raw_tool.get("function") if raw_tool.get("type") == "function" else raw_tool
+    if not isinstance(function, dict):
+        raise ValueError(f"Invalid tool definition in {tool_file}: expected an object.")
+
+    name = function.get("name")
+    if not name:
+        raise ValueError(f"Invalid tool definition in {tool_file}: missing tool name.")
+
+    parameters = function.get("parameters") or {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+    if not isinstance(parameters, dict):
+        raise ValueError(f"Invalid tool definition for '{name}' in {tool_file}: parameters must be an object.")
+
+    base_dir = os.path.dirname(tool_file)
+    cwd = function.get("cwd")
+    if isinstance(cwd, str) and cwd and not os.path.isabs(cwd):
+        cwd = os.path.abspath(os.path.join(base_dir, cwd))
+
+    spec = {
+        "description": function.get("description", "External command-backed tool."),
+        "parameters": parameters,
+        "source": tool_file,
+        "handler": _tool_command_handler_factory(name, {
+            "command": function.get("command"),
+            "argv": function.get("argv"),
+            "cwd": cwd,
+            "timeout": function.get("timeout", DEFAULT_TOOL_TIMEOUT),
+        }),
+    }
+    return {"name": name, "spec": spec}
+
+
+def _load_external_tools(tool_files: List[str]) -> Dict[str, Dict[str, Any]]:
+    loaded: Dict[str, Dict[str, Any]] = {}
+    for tool_file in tool_files:
+        target = os.path.abspath(tool_file)
+        with open(target, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        if isinstance(payload, dict):
+            raw_tools = payload.get("tools")
+            if not isinstance(raw_tools, list):
+                raise ValueError(f"Tool file {target} must contain a 'tools' array.")
+        elif isinstance(payload, list):
+            raw_tools = payload
+        else:
+            raise ValueError(f"Tool file {target} must be a JSON object or array.")
+
+        for raw_tool in raw_tools:
+            if not isinstance(raw_tool, dict):
+                raise ValueError(f"Tool file {target} contains a non-object tool entry.")
+            normalized = _normalize_external_tool_definition(raw_tool, target)
+            name = normalized["name"]
+            if name in loaded:
+                raise ValueError(f"Duplicate external tool name: {name}")
+            loaded[name] = normalized["spec"]
+
+    return loaded
+
+
+TOOL_REGISTRY = _build_tool_registry()
+
+
+def _build_tool_schemas() -> List[Dict[str, Any]]:
+    schemas: List[Dict[str, Any]] = []
+    for name, spec in TOOL_REGISTRY.items():
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": spec["parameters"],
+            },
+        })
+    return schemas
+
+
+TOOL_SCHEMAS = _build_tool_schemas()
+
+
+def configure_tool_registry(tool_files: Optional[List[str]] = None) -> None:
+    global TOOL_REGISTRY, TOOL_SCHEMAS, EXTERNAL_TOOL_FILES
+
+    registry = _build_tool_registry()
+    resolved_files = [os.path.abspath(path) for path in (tool_files or [])]
+    external_tools = _load_external_tools(resolved_files) if resolved_files else {}
+    for name, spec in external_tools.items():
+        if name in registry:
+            raise ValueError(f"Tool name collision: {name}")
+        registry[name] = spec
+
+    TOOL_REGISTRY = registry
+    TOOL_SCHEMAS = _build_tool_schemas()
+    EXTERNAL_TOOL_FILES = resolved_files
+
+
+def _parse_tool_arguments(raw: Any) -> Dict[str, Any]:
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("Tool arguments must decode to a JSON object.")
+        return parsed
+    raise ValueError(f"Unsupported tool arguments type: {type(raw).__name__}")
+
+
+def _tool_error_message(error: Exception) -> str:
+    return _json_result({
+        "ok": False,
+        "error": type(error).__name__,
+        "message": str(error),
+    })
+
+
+def execute_tool_call(name: str, arguments: Dict[str, Any]) -> str:
+    spec = TOOL_REGISTRY.get(name)
+    if not spec:
+        raise KeyError(f"Unknown tool: {name}")
+    handler: ToolHandler = spec["handler"]
+    return handler(**arguments)
+
+
+def _tool_support_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(token in lower for token in ("tool", "tool_choice", "tool_calls", "function_call"))
+
+
+def _message_header(role: str) -> str:
+    return {
+        "user": ">>>",
+        "assistant": "<<<",
+        "tool": "[tool]",
+    }.get(role, f"[{role}]")
+
+
+def _message_display_text(message: Dict[str, Any]) -> str:
+    role = message.get("role", "assistant")
+    content = message.get("content") or ""
+    if role == "tool":
+        name = message.get("tool_name") or message.get("name") or message.get("tool_call_id") or "tool"
+        return f"{name}\n{content}" if content else name
+
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        lines = []
+        if content:
+            lines.append(content)
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            name = function.get("name", "unknown_tool")
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                argument_text = arguments
+            else:
+                argument_text = json.dumps(arguments, ensure_ascii=False)
+            lines.append(f"tool_call: {name}({argument_text})")
+        return "\n".join(lines)
+
+    return content
+
+
+def _print_message(message: Dict[str, Any]) -> None:
+    print(f"{_message_header(message.get('role', 'assistant'))}:")
+    text = _message_display_text(message)
+    if text:
+        try:
+            render_markdown_to_terminal(text)
+        except Exception:
+            print(text)
+    print("\n")
+
+
+def _normalize_openai_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") or {}
+        call_id = tool_call.get("id") or f"call_{index}"
+        try:
+            arguments = _parse_tool_arguments(function.get("arguments"))
+        except Exception as exc:
+            arguments = {"_raw": function.get("arguments"), "_parse_error": str(exc)}
+        normalized.append({
+            "id": call_id,
+            "name": function.get("name", "unknown_tool"),
+            "arguments": arguments,
+        })
+    return normalized
+
+
+def _normalize_ollama_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") or {}
+        try:
+            arguments = _parse_tool_arguments(function.get("arguments"))
+        except Exception as exc:
+            arguments = {"_raw": function.get("arguments"), "_parse_error": str(exc)}
+        normalized.append({
+            "id": tool_call.get("id") or f"call_{function.get('index', index)}",
+            "name": function.get("name", "unknown_tool"),
+            "arguments": arguments,
+        })
+    return normalized
+
+
+def _assistant_message_from_response(data: Dict[str, Any], use_openai: bool) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if use_openai:
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        normalized_calls = _normalize_openai_tool_calls(message.get("tool_calls") or [])
+        return _assistant_message_from_parts(content, normalized_calls, use_openai), normalized_calls
+
+    message = data.get("message") or {}
+    content = message.get("content") or ""
+    normalized_calls = _normalize_ollama_tool_calls(message.get("tool_calls") or [])
+    return _assistant_message_from_parts(content, normalized_calls, use_openai), normalized_calls
+
+
+def _tool_result_message(name: str, result: str, call_id: str, use_openai: bool) -> Dict[str, Any]:
+    if use_openai:
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": result,
+        }
+    return {
+        "role": "tool",
+        "tool_name": name,
+        "content": result,
+    }
+
+
+def _tool_summary(call: Dict[str, Any]) -> str:
+    return f"{call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})"
+
+
+def _open_chat_stream(
+    url: str,
+    payload: Dict[str, Any],
+    allow_tool_fallback: bool,
+) -> Tuple[requests.Response, bool]:
+    using_tools = "tools" in payload
+    try:
+        response = requests.post(url, json=payload, stream=True, timeout=180)
+        response.raise_for_status()
+        return response, using_tools
+    except requests.exceptions.HTTPError as exc:
+        response = exc.response
+        if using_tools and allow_tool_fallback and response is not None and _tool_support_error(response.text):
+            fallback_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+            print("⚠️ Endpoint rejected tools for this request. Retrying without tool definitions.")
+            retry = requests.post(url, json=fallback_payload, stream=True, timeout=180)
+            retry.raise_for_status()
+            return retry, False
+        raise
+
+
+def _update_openai_tool_buffers(buffers: Dict[int, Dict[str, Any]], tool_calls: List[Dict[str, Any]]) -> None:
+    for tool_call in tool_calls:
+        index = tool_call.get("index", 0)
+        buffer = buffers.setdefault(index, {"id": tool_call.get("id") or f"call_{index}", "name": "", "arguments": ""})
+        if tool_call.get("id"):
+            buffer["id"] = tool_call["id"]
+        function = tool_call.get("function") or {}
+        if function.get("name"):
+            buffer["name"] = function["name"]
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            buffer["arguments"] = f"{buffer['arguments']}{arguments}"
+        elif isinstance(arguments, dict):
+            buffer["arguments"] = json.dumps(arguments, ensure_ascii=False)
+
+
+def _update_ollama_tool_buffers(buffers: Dict[int, Dict[str, Any]], tool_calls: List[Dict[str, Any]]) -> None:
+    for index, tool_call in enumerate(tool_calls):
+        function = tool_call.get("function") or {}
+        call_index = function.get("index", index)
+        buffer = buffers.setdefault(call_index, {"id": tool_call.get("id") or f"call_{call_index}", "name": "", "arguments": {}})
+        if tool_call.get("id"):
+            buffer["id"] = tool_call["id"]
+        if function.get("name"):
+            buffer["name"] = function["name"]
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            buffer["arguments"] = arguments
+        elif isinstance(arguments, str):
+            try:
+                buffer["arguments"] = _parse_tool_arguments(arguments)
+            except Exception:
+                buffer["arguments"] = {"_raw": arguments}
+
+
+def _finalize_stream_tool_calls(buffers: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    finalized: List[Dict[str, Any]] = []
+    for index in sorted(buffers):
+        buffer = buffers[index]
+        arguments = buffer.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = _parse_tool_arguments(arguments)
+            except Exception as exc:
+                parsed_arguments = {"_raw": arguments, "_parse_error": str(exc)}
+        else:
+            parsed_arguments = arguments
+        finalized.append({
+            "id": buffer.get("id") or f"call_{index}",
+            "name": buffer.get("name") or "unknown_tool",
+            "arguments": parsed_arguments or {},
+        })
+    return finalized
+
+
+def _assistant_message_from_parts(content: str, normalized_calls: List[Dict[str, Any]], use_openai: bool) -> Dict[str, Any]:
+    assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if not normalized_calls:
+        return assistant_message
+
+    if use_openai:
+        assistant_message["tool_calls"] = [
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                },
+            }
+            for call in normalized_calls
+        ]
+        return assistant_message
+
+    assistant_message["tool_calls"] = [
+        {
+            "type": "function",
+            "function": {
+                "index": index,
+                "name": call["name"],
+                "arguments": call["arguments"],
+            },
+        }
+        for index, call in enumerate(normalized_calls)
+    ]
+    return assistant_message
+
+
+def _stream_chat_response(
+    url: str,
+    payload: Dict[str, Any],
+    use_openai: bool,
+    allow_tool_fallback: bool,
+    render_mode: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    response, tools_active_for_turn = _open_chat_stream(url, payload, allow_tool_fallback)
+    content_parts: List[str] = []
+    openai_tool_buffers: Dict[int, Dict[str, Any]] = {}
+    ollama_tool_buffers: Dict[int, Dict[str, Any]] = {}
+    printed_content = False
+
+    try:
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            raw = line.decode("utf-8")
+            if use_openai and raw.startswith("data: "):
+                payload_text = raw[6:]
+                if payload_text == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("message"):
+                    message = chunk.get("message") or {}
+                    content = message.get("content") or ""
+                    if content:
+                        if render_mode == "stream":
+                            print(content, end="", flush=True)
+                            printed_content = True
+                        content_parts.append(content)
+                    _update_ollama_tool_buffers(ollama_tool_buffers, message.get("tool_calls") or [])
+                    continue
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content") or ""
+                if content:
+                    if render_mode == "stream":
+                        print(content, end="", flush=True)
+                        printed_content = True
+                    content_parts.append(content)
+                _update_openai_tool_buffers(openai_tool_buffers, delta.get("tool_calls") or [])
+                continue
+
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            message = chunk.get("message") or {}
+            content = message.get("content") or ""
+            if content:
+                if render_mode == "stream":
+                    print(content, end="", flush=True)
+                    printed_content = True
+                content_parts.append(content)
+            _update_ollama_tool_buffers(ollama_tool_buffers, message.get("tool_calls") or [])
+    finally:
+        response.close()
+
+    if printed_content:
+        print()
+
+    normalized_calls = _finalize_stream_tool_calls(openai_tool_buffers if openai_tool_buffers else ollama_tool_buffers)
+    content = "".join(content_parts)
+    assistant_message = _assistant_message_from_parts(content, normalized_calls, use_openai)
+    return assistant_message, normalized_calls, tools_active_for_turn
 
 
 def _pid_alive(pid: int) -> bool:
@@ -164,15 +812,7 @@ def load_context() -> List[Dict]:
             print("📜 Previous conversation:")
             print("=" * 60)
             for msg in messages:
-                role = ">>>" if msg["role"] == "user" else "<<<"
-                # Print role header then render the message content using Rich
-                print(f"{role}:")
-                try:
-                    render_markdown_to_terminal(msg.get('content', ''))
-                except Exception:
-                    # Fallback to plain printing if rendering fails
-                    print(msg.get('content', ''))
-                print("\n")
+                _print_message(msg)
             print("=" * 60)
             # Mark that we are continuing a session so callers can
             # suppress redundant startup output (banner, help, etc.)
@@ -238,7 +878,10 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
         return messages
 
     print("🗜️ Compacting conversation...")
-    history_text = "\n".join(f"{msg['role'].upper()}: {msg['content']}" for msg in messages)
+    history_text = "\n".join(
+        f"{msg.get('role', 'assistant').upper()}: {_message_display_text(msg)}"
+        for msg in messages
+    )
     summary_prompt = (
         "You are an expert summarizer. Condense the entire conversation history "
         "into a clear, concise summary (max 400 words) that retains all important "
@@ -301,7 +944,7 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
         print(f"❌ Compact failed: {e}")
         return messages
 
-def chat_with_ollama(model: str, base_url: str, use_openai: bool):
+def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: bool, render_mode: str):
     global ATTACHMENT_BUFFER
 
     # Determine endpoint based on flag
@@ -347,7 +990,9 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
         print(" /model [name] → Switch model (no name lists available models)")
         print(" /file <filename> → Add file to next message")
         print(" /clearfiles → Clear attachment buffer")
+        print(" /tools → List available local tools")
         print(" /status → View session information")
+        print(f" Render mode: {render_mode}")
         print(" Enter → submit | Alt-Enter / Shift-Enter / Ctrl-J → new line\n")
 
     while True:
@@ -365,7 +1010,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
             known_cmds = {
                 '/exit', '/quit', '/bye',
                 '/reset', '/compact', '/model',
-                '/file', '/clearfiles', '/status', '/?', '/help',
+                '/file', '/clearfiles', '/status', '/tools', '/?', '/help',
                 '/redraw'
             }
             if cmd.startswith('/') and cmd not in known_cmds:
@@ -435,6 +1080,17 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
                     print(f"✅ Added to attachments: {filename} ({len(content)} characters)")
                 continue
 
+            elif cmd == '/tools':
+                if not enable_tools:
+                    print("🧰 Local tools are disabled for this session.")
+                    continue
+                print(f"🧰 Available local tools ({len(TOOL_SCHEMAS)}):")
+                for schema in TOOL_SCHEMAS:
+                    function = schema["function"]
+                    tool_spec = TOOL_REGISTRY.get(function["name"], {})
+                    print(f" - {function['name']} [{_tool_display_source(tool_spec)}]: {function['description']}")
+                continue
+
             elif cmd in ['/?', '/help']:
                 # Show available commands/help
                 print("Available commands:")
@@ -444,6 +1100,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
                 print(" /model [name] → Switch model (no name lists available models)")
                 print(" /file <filename> → Add file to next message")
                 print(" /clearfiles → Clear attachment buffer")
+                print(" /tools → List available local tools")
                 print(" /status → View session information")
                 print(" /? or /help → Show this help text")
                 print(" Enter → submit | Alt-Enter / Shift-Enter / Ctrl-J → new line\n")
@@ -483,6 +1140,10 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
 
                 # Attachment buffer status
                 print(f"📎 Attachments: {len(ATTACHMENT_BUFFER)} file(s) pending")
+                print(f"🧰 Local Tools: {'Enabled' if enable_tools else 'Disabled'} ({len(TOOL_SCHEMAS) if enable_tools else 0} available)")
+                print(f"🎨 Render Mode: {render_mode}")
+                if EXTERNAL_TOOL_FILES:
+                    print(f"📦 External Tool Files: {len(EXTERNAL_TOOL_FILES)} loaded")
                 print("-------------------------\n")
                 continue
 
@@ -497,52 +1158,50 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
 
             print("<<< ", end="", flush=True)
 
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": True
-            }
+            request_uses_tools = enable_tools
+            while True:
+                payload: Dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "stream": True,
+                }
+                if request_uses_tools:
+                    payload["tools"] = TOOL_SCHEMAS
+                    if use_openai:
+                        payload["tool_choice"] = "auto"
 
-            response = requests.post(url, json=payload, stream=True, timeout=180)
-            response.raise_for_status()
+                assistant_message, normalized_calls, tools_active_for_turn = _stream_chat_response(
+                    url,
+                    payload,
+                    use_openai,
+                    allow_tool_fallback=True,
+                    render_mode=render_mode,
+                )
+                messages.append(assistant_message)
 
-            full_response = ""
-            for line in response.iter_lines():
-                if line:
+                content = assistant_message.get("content") or ""
+                if content and render_mode == "markdown":
+                    print()
                     try:
-                        raw = line.decode('utf-8')
-                        if use_openai:
-                            if not raw.startswith('data: '):
-                                continue
-                            raw = raw[6:]
-                            if raw == '[DONE]':
-                                continue
-                            chunk = json.loads(raw)
-                            if chunk.get("choices"):
-                                delta = chunk["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    full_response += content
-                            # Fallback: server responded in native Ollama format despite -o
-                            elif "message" in chunk and "content" in chunk["message"]:
-                                content = chunk["message"]["content"]
-                                full_response += content
-                        else:
-                            chunk = json.loads(raw)
-                            if "message" in chunk and "content" in chunk["message"]:
-                                content = chunk["message"]["content"]
-                                full_response += content
-                    except json.JSONDecodeError:
-                        continue
+                        render_markdown_to_terminal(content)
+                    except Exception:
+                        print(content)
 
-            print()
-            if full_response:
-                messages.append({"role": "assistant", "content": full_response})
-                # Render nicely if Rich is available
-                try:
-                    render_markdown_to_terminal(full_response)
-                except Exception:
-                    print(full_response)
+                if not normalized_calls:
+                    if not content:
+                        print()
+                    break
+
+                print()
+                for call in normalized_calls:
+                    print(f"[tool] { _tool_summary(call) }")
+                    try:
+                        result = execute_tool_call(call["name"], call["arguments"])
+                    except Exception as exc:
+                        result = _tool_error_message(exc)
+                    messages.append(_tool_result_message(call["name"], result, call["id"], use_openai))
+
+                request_uses_tools = tools_active_for_turn
 
         except requests.exceptions.ConnectionError:
             print(f"\n❌ Could not connect to server at {base_url}. Is it running?")
@@ -566,7 +1225,12 @@ def main():
     parser.add_argument("-H", "--host", default="localhost", help="Hostname or IP address of the Ollama server (default: localhost)")
     parser.add_argument("-P", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
     parser.add_argument("-c", "--clean", action="store_true", help="Start with empty context (overwrites old context on exit)")
+    parser.add_argument("-t", "--tools", action="append", default=[], help="Path to a JSON file defining additional command-backed tools. Can be passed multiple times.")
+    parser.add_argument("--no-tools", action="store_true", help="Disable local tool definitions for this session")
+    parser.add_argument("--render-mode", choices=["markdown", "stream"], default=DEFAULT_RENDER_MODE, help="How assistant replies are shown: buffered markdown view or live raw stream.")
     args = parser.parse_args()
+
+    configure_tool_registry(args.tools)
 
     # Construct base URL
     base_url = f"http://{args.host}:{args.port}"
@@ -608,7 +1272,7 @@ def main():
         except Exception as e:
             print(f"⚠️ Could not remove history file: {e}")
 
-    chat_with_ollama(args.model, base_url, args.openai)
+    chat_with_ollama(args.model, base_url, args.openai, enable_tools=not args.no_tools, render_mode=args.render_mode)
 
 if __name__ == "__main__":
     main()
