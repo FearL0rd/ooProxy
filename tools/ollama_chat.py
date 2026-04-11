@@ -2,6 +2,9 @@ import requests
 import json
 import os
 import argparse
+import atexit
+import sys
+import signal
 from typing import List, Dict
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -10,7 +13,117 @@ from prompt_toolkit.key_binding import KeyBindings
 
 CONTEXT_FILE = ".ollama_chat_context"
 HISTORY_FILE = ".ollama_chat_history"
+LOCK_FILE = ".ollama_chat_lock"
 ATTACHMENT_BUFFER: List[Dict] = []
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        # signal 0 just tests for existence of process
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _is_ollama_chat_process(pid: int) -> bool:
+    """Heuristic: return True if PID's command or cwd looks like this chat tool.
+
+    Checks /proc/<pid>/cmdline for this script name or 'ollama_chat', and
+    /proc/<pid>/cwd for matching working directory. Returns False if the
+    checks fail or indicate a different program.
+    """
+    try:
+        # Check cmdline
+        cmdline_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(cmdline_path):
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            # cmdline is null-separated
+            parts = [p.decode(errors="ignore") for p in raw.split(b"\0") if p]
+            script_name = os.path.basename(__file__)
+            for p in parts:
+                if script_name in p or "ollama_chat" in p.lower():
+                    return True
+
+        # Check cwd matches current working directory
+        cwd_path = f"/proc/{pid}/cwd"
+        if os.path.islink(cwd_path):
+            try:
+                other_cwd = os.readlink(cwd_path)
+                if os.path.abspath(other_cwd) == os.path.abspath(os.getcwd()):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        # If we cannot inspect the process, be conservative and assume it's not ours
+        return False
+
+    return False
+
+
+def acquire_pidfile(lockfile: str = LOCK_FILE) -> None:
+    """Create an exclusive pidfile. Exit if a live PID holds the lock."""
+    try:
+        fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        print(f"🔐 Acquired lock: {lockfile} (PID {os.getpid()})")
+        return
+    except FileExistsError:
+        # lock exists — check whether it's stale
+        try:
+            with open(lockfile, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                existing = int(content) if content else None
+        except Exception:
+            existing = None
+
+        if existing and _pid_alive(existing):
+            # If the running PID appears to be an ollama_chat process, respect it.
+            if _is_ollama_chat_process(existing):
+                print(f"⛔ Another session (PID {existing}) is using this folder. Exiting.")
+                sys.exit(1)
+            # Otherwise treat as stale and attempt to reclaim
+            print(f"⚠️ Lock held by PID {existing} which is not an ollama_chat instance; reclaiming lock.")
+
+        # stale lock: remove and retry once
+        try:
+            os.remove(lockfile)
+        except Exception:
+            print(f"⚠️ Could not remove stale lockfile: {lockfile}")
+            sys.exit(1)
+
+        try:
+            fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            print(f"🔐 Acquired lock after removing stale lock: {lockfile} (PID {os.getpid()})")
+            return
+        except Exception as e:
+            print(f"⛔ Failed to create lockfile: {e}")
+            sys.exit(1)
+
+
+def release_pidfile(lockfile: str = LOCK_FILE) -> None:
+    try:
+        if os.path.exists(lockfile):
+            try:
+                with open(lockfile, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    existing = int(content) if content else None
+            except Exception:
+                existing = None
+
+            # Only remove if this process owns the lock (best effort)
+            if existing is None or existing == os.getpid():
+                try:
+                    os.remove(lockfile)
+                    print(f"🗑️ Released lock: {lockfile}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 def load_context() -> List[Dict]:
     if not os.path.exists(CONTEXT_FILE):
@@ -23,7 +136,7 @@ def load_context() -> List[Dict]:
             print("📜 Previous conversation:")
             print("=" * 60)
             for msg in messages:
-                role = "You" if msg["role"] == "user" else "Ollama"
+                role = ">>>" if msg["role"] == "user" else "<<<"
                 print(f"{role}: {msg['content']}\n")
             print("=" * 60)
             print("Continuing conversation...\n")
@@ -199,7 +312,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
 
     while True:
         try:
-            user_input = session.prompt("You: ").strip()
+            user_input = session.prompt(">>> ").strip()
             if not user_input:
                 continue
 
@@ -304,7 +417,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
 
             messages.append({"role": "user", "content": full_user_message})
 
-            print("Ollama: ", end="", flush=True)
+            print("<<< ", end="", flush=True)
 
             payload = {
                 "model": model,
@@ -376,6 +489,23 @@ def main():
 
     # Construct base URL
     base_url = f"http://{args.host}:{args.port}"
+
+    # Acquire pidfile to prevent concurrent sessions in same folder
+    acquire_pidfile()
+
+    # Ensure pidfile is removed on exit
+    atexit.register(release_pidfile)
+
+    # Make signals trigger clean exit so atexit handlers run
+    def _handle_signal(signum, frame):
+        sys.exit(0)
+
+    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _handle_signal)
+        except Exception:
+            # some signals may not be available on all platforms
+            pass
 
     chat_with_ollama(args.model, base_url, args.openai)
 
