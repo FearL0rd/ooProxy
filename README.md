@@ -21,7 +21,7 @@ VS Code Copilot Chat
   (NVIDIA NIM, OpenAI, Groq, …)
 ```
 
-ooProxy listens on `localhost:11434` and exposes the full Ollama API surface (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/v1/chat/completions`, etc.). It translates requests to OpenAI format, forwards them to the configured remote backend, and translates the responses back — including streaming.
+ooProxy listens on `localhost:11434` and exposes the full Ollama API surface (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/v1/chat/completions`, `/v1/responses`, etc.). It translates requests to OpenAI format, forwards them to the configured remote backend, and translates the responses back — including streaming.
 
 ---
 

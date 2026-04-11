@@ -1,8 +1,10 @@
-"""Translate OpenAI response bodies to Ollama format."""
+"""Translate OpenAI response bodies to client-compatible formats."""
 
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from datetime import datetime, timezone
 
 
@@ -79,3 +81,101 @@ def openai_embeddings_to_ollama(data: dict) -> dict:
     return {
         "embedding": data["data"][0]["embedding"],
     }
+
+
+def _response_output_text_part(text: str) -> dict:
+    return {
+        "type": "output_text",
+        "text": text,
+        "annotations": [],
+    }
+
+
+def _chat_message_to_responses_output(message: dict) -> tuple[list[dict], str]:
+    output: list[dict] = []
+    accumulated_text = []
+
+    content = message.get("content") or ""
+    if content:
+        accumulated_text.append(content)
+        output.append({
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "status": "completed",
+            "role": message.get("role", "assistant"),
+            "content": [_response_output_text_part(content)],
+        })
+
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") or {}
+        output.append({
+            "id": tool_call.get("id") or f"fc_{uuid.uuid4().hex}",
+            "type": "function_call",
+            "call_id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:16]}",
+            "name": function.get("name", "unknown_tool"),
+            "arguments": function.get("arguments", ""),
+            "status": "completed",
+        })
+
+    return output, "".join(accumulated_text)
+
+
+def responses_usage_from_chat(data: dict) -> dict:
+    usage = data.get("usage") or {}
+    return {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": usage.get("completion_tokens", 0),
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+
+
+def openai_chat_to_responses(
+    data: dict,
+    request_body: dict,
+    response_id: str,
+    *,
+    previous_response_id: str | None = None,
+    created_at: int | None = None,
+) -> tuple[dict, list[dict]]:
+    """Convert a non-streaming OpenAI chat completion to a Responses API payload."""
+    created = created_at or int(time.time())
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {"role": "assistant", "content": ""}
+    output, output_text = _chat_message_to_responses_output(message)
+    finish_reason = choice.get("finish_reason") or "stop"
+    status = "completed" if finish_reason not in {"length", "content_filter"} else "incomplete"
+    incomplete_details = None
+    if finish_reason == "length":
+        incomplete_details = {"reason": "max_output_tokens"}
+
+    response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "completed_at": int(time.time()),
+        "status": status,
+        "error": None,
+        "incomplete_details": incomplete_details,
+        "instructions": request_body.get("instructions"),
+        "metadata": request_body.get("metadata") or {},
+        "model": request_body["model"],
+        "output": output,
+        "output_text": output_text,
+        "parallel_tool_calls": bool(request_body.get("parallel_tool_calls", True)),
+        "previous_response_id": previous_response_id,
+        "reasoning": request_body.get("reasoning") or {"effort": None, "summary": None},
+        "store": bool(request_body.get("store", True)),
+        "temperature": request_body.get("temperature", 1),
+        "text": request_body.get("text") or {"format": {"type": "text"}},
+        "tool_choice": request_body.get("tool_choice", "auto"),
+        "tools": request_body.get("tools") or [],
+        "top_p": request_body.get("top_p", 1),
+        "truncation": request_body.get("truncation", "disabled"),
+        "usage": responses_usage_from_chat(data),
+        "user": request_body.get("user"),
+    }
+
+    assistant_messages = [message]
+    return response, assistant_messages

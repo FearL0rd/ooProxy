@@ -23,7 +23,12 @@ from modules._server.handlers.stubs import (
     pull_handler,
     push_handler,
 )
-from modules._server.handlers.openai_compat import v1_chat_handler, v1_embeddings_handler, v1_models_handler
+from modules._server.handlers.openai_compat import (
+    v1_chat_handler,
+    v1_embeddings_handler,
+    v1_models_handler,
+    v1_responses_handler,
+)
 from modules._server.handlers.version import root_handler, version_handler
 
 
@@ -42,6 +47,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
 
     # OpenAI-compatible layer (used by VS Code Copilot Chat)
     app.add_api_route("/v1/chat/completions", v1_chat_handler, methods=["POST"], **_r)
+    app.add_api_route("/v1/responses", v1_responses_handler, methods=["POST"], **_r)
     app.add_api_route("/v1/models", v1_models_handler, methods=["GET"], **_r)
     app.add_api_route("/v1/embeddings", v1_embeddings_handler, methods=["POST"], **_r)
 

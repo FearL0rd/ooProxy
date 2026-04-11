@@ -1,4 +1,4 @@
-"""Translate Ollama request bodies to OpenAI format."""
+"""Translate client request bodies to upstream OpenAI chat format."""
 
 from __future__ import annotations
 
@@ -144,3 +144,128 @@ def embeddings_to_openai(body: dict) -> dict:
         "model": body["model"],
         "input": body.get("prompt", ""),
     }
+
+
+def _responses_content_to_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"input_text", "output_text", "text"}:
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif item_type == "refusal":
+                refusal = item.get("refusal")
+                if isinstance(refusal, str):
+                    parts.append(refusal)
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _responses_item_to_messages(item: object) -> list[dict]:
+    if isinstance(item, str):
+        return [{"role": "user", "content": item}]
+    if not isinstance(item, dict):
+        return []
+
+    item_type = item.get("type")
+
+    if item_type == "function_call_output":
+        output = item.get("output", "")
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        message = {
+            "role": "tool",
+            "content": output,
+        }
+        if item.get("call_id"):
+            message["tool_call_id"] = item["call_id"]
+        return [message]
+
+    if item_type == "function_call":
+        arguments = item.get("arguments", "")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": item.get("call_id") or item.get("id") or "call_0",
+                "type": "function",
+                "function": {
+                    "name": item.get("name", "unknown_tool"),
+                    "arguments": arguments,
+                },
+            }],
+        }]
+
+    if item_type == "message" or "role" in item:
+        content = _responses_content_to_text(item.get("content"))
+        return [{
+            "role": item.get("role", "user"),
+            "content": content,
+        }]
+
+    if item_type in {"input_text", "output_text", "text"}:
+        text = item.get("text")
+        if isinstance(text, str):
+            return [{"role": item.get("role", "user"), "content": text}]
+
+    return []
+
+
+def _responses_input_to_messages(input_value: object) -> list[dict]:
+    if input_value is None:
+        return []
+    if isinstance(input_value, (str, dict)):
+        return _responses_item_to_messages(input_value)
+    if isinstance(input_value, list):
+        messages: list[dict] = []
+        for item in input_value:
+            messages.extend(_responses_item_to_messages(item))
+        return messages
+    return []
+
+
+def responses_to_openai_chat(body: dict, previous_messages: list[dict] | None = None) -> tuple[dict, list[dict]]:
+    """Convert an OpenAI /v1/responses request to /v1/chat/completions."""
+    messages = [dict(message) for message in (previous_messages or [])]
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        if not messages or messages[0].get("role") != "system" or messages[0].get("content") != instructions:
+            messages.insert(0, {"role": "system", "content": instructions})
+
+    messages.extend(_responses_input_to_messages(body.get("input")))
+
+    out: dict = {
+        "model": body["model"],
+        "messages": messages,
+        "stream": bool(body.get("stream", False)),
+    }
+    if body.get("tools") is not None:
+        out["tools"] = body["tools"]
+    if body.get("tool_choice") is not None:
+        out["tool_choice"] = body["tool_choice"]
+    if out["stream"]:
+        out["stream_options"] = {"include_usage": True}
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+    if body.get("max_output_tokens") is not None:
+        out["max_tokens"] = body["max_output_tokens"]
+    text_config = body.get("text") or {}
+    response_format = text_config.get("format") if isinstance(text_config, dict) else None
+    if isinstance(response_format, dict) and response_format.get("type") in {"json_object", "json_schema"}:
+        out["response_format"] = response_format
+    if "max_tokens" not in out:
+        out["max_tokens"] = _DEFAULT_MAX_TOKENS
+    return out, messages
