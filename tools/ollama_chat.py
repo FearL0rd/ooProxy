@@ -365,7 +365,8 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
             known_cmds = {
                 '/exit', '/quit', '/bye',
                 '/reset', '/compact', '/model',
-                '/file', '/clearfiles', '/status', '/?', '/help'
+                '/file', '/clearfiles', '/status', '/?', '/help',
+                '/redraw'
             }
             if cmd.startswith('/') and cmd not in known_cmds:
                 print(f"⚠️ Unknown command '{cmd}'. Messages starting with '/' are commands — not sent."
@@ -451,6 +452,17 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
             elif cmd == '/clearfiles':
                 ATTACHMENT_BUFFER.clear()
                 print("🧹 Attachment buffer cleared.")
+                continue
+
+            elif cmd == '/redraw':
+                # Save any recent messages, clear screen, and reload context as if resuming
+                save_context(messages)
+                # Clear terminal screen (ANSI escape code)
+                print("\033c", end="")
+                # Reset attachment buffer
+                ATTACHMENT_BUFFER.clear()
+                # Reload context (this will also print the previous conversation and set CONTINUE_SESSION)
+                messages = load_context()
                 continue
 
             elif cmd == '/status':
