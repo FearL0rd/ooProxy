@@ -9,7 +9,7 @@
         "properties": {},
         "required": []
       },
-      "command": "git status --short"
+      "command": "git status"
     },
     {
       "name": "list_tmp",
