@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# NIM (and some other hosted endpoints) default to a very small max_tokens (e.g. 32)
+# when the field is omitted, causing responses to be silently truncated.  Inject this
+# default whenever the client does not specify num_predict / max_tokens explicitly.
+_DEFAULT_MAX_TOKENS = 32768
+
 
 def chat_to_openai(body: dict) -> dict:
     """Convert an Ollama /api/chat request body to OpenAI /v1/chat/completions."""
@@ -20,11 +25,17 @@ def chat_to_openai(body: dict) -> dict:
         if "top_p" in opts:
             out["top_p"] = opts["top_p"]
         if "num_predict" in opts:
-            out["max_tokens"] = opts["num_predict"]
+            num = opts["num_predict"]
+            if num and num > 0:
+                out["max_tokens"] = num
+            # num_predict == -1 means "unlimited" in Ollama — omit max_tokens
+            # so the server uses its own ceiling rather than a small proxy default.
         if "stop" in opts:
             out["stop"] = opts["stop"]
     if "format" in body and body["format"] == "json":
         out["response_format"] = {"type": "json_object"}
+    if "max_tokens" not in out:
+        out["max_tokens"] = _DEFAULT_MAX_TOKENS
     return out
 
 
@@ -50,11 +61,15 @@ def generate_to_openai(body: dict) -> dict:
         if "top_p" in opts:
             out["top_p"] = opts["top_p"]
         if "num_predict" in opts:
-            out["max_tokens"] = opts["num_predict"]
+            num = opts["num_predict"]
+            if num and num > 0:
+                out["max_tokens"] = num
         if "stop" in opts:
             out["stop"] = opts["stop"]
     if "format" in body and body["format"] == "json":
         out["response_format"] = {"type": "json_object"}
+    if "max_tokens" not in out:
+        out["max_tokens"] = _DEFAULT_MAX_TOKENS
     return out
 
 

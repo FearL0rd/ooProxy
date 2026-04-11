@@ -31,11 +31,11 @@ def main():
     parser = argparse.ArgumentParser(description="List available models from an Ollama-compatible server.")
     parser.add_argument("model", nargs="?", default="", help="Ignored (kept for CLI compatibility with ollama_chat.py)")
     parser.add_argument("-o", "--openai", action="store_true", help="Use OpenAI compatible API endpoint")
-    parser.add_argument("-i", "--ip", default="localhost", help="IP address of the Ollama server (default: localhost)")
-    parser.add_argument("-p", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
+    parser.add_argument("-H", "--host", default="localhost", help="Hostname or IP address of the Ollama server (default: localhost)")
+    parser.add_argument("-P", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
     args = parser.parse_args()
 
-    base_url = f"http://{args.ip}:{args.port}"
+    base_url = f"http://{args.host}:{args.port}"
 
     print(f"🔍 Fetching models from {base_url}...\n")
     models = list_ollama_models(base_url, args.openai)

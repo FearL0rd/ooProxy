@@ -18,7 +18,7 @@ SPEC = ModuleSpec(
         OptionSpec(
             flags=("--url",),
             dest="url",
-            help="Remote OpenAI-compatible base URL (env: OPENAI_BASE_URL)",
+            help="Remote OpenAI-compatible base URL, including port if non-standard (env: OPENAI_BASE_URL)",
             metavar="URL",
         ),
         OptionSpec(

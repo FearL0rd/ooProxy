@@ -17,7 +17,7 @@ SPEC = ModuleSpec(
         OptionSpec(
             flags=("--url",),
             dest="url",
-            help="Remote OpenAI-compatible base URL (env: OPENAI_BASE_URL)",
+            help="Remote OpenAI-compatible base URL, including port if non-standard (env: OPENAI_BASE_URL)",
             metavar="URL",
         ),
         OptionSpec(
@@ -27,14 +27,14 @@ SPEC = ModuleSpec(
             metavar="KEY",
         ),
         OptionSpec(
-            flags=("--host",),
+            flags=("-H", "--host"),
             dest="host",
             help="Local IP address to listen on (default: 127.0.0.1)",
             metavar="HOST",
             default="127.0.0.1",
         ),
         OptionSpec(
-            flags=("--port",),
+            flags=("-P", "--port"),
             dest="port",
             help="Local port to listen on (default: 11434)",
             metavar="PORT",
@@ -43,7 +43,8 @@ SPEC = ModuleSpec(
     ),
     usage_examples=(
         "ooproxy.py -s --url https://integrate.api.nvidia.com/v1 --key nvapi-xxx",
-        "ooproxy.py -s --host 0.0.0.0 --port 8080",
+        "ooproxy.py -s --url http://myserver:8080/v1 --key sk-xxx",
+        "ooproxy.py -s --host 0.0.0.0 --port 11434",
         "OPENAI_BASE_URL=https://... OPENAI_API_KEY=sk-... ooproxy.py -s",
     ),
 )

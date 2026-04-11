@@ -138,6 +138,7 @@ def print_result(result: ResultEnvelope, json_output: bool, render_text) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = None
     try:
         modules = discover_modules()
         parser, _ = build_parser(modules)
@@ -160,6 +161,9 @@ def main(argv: list[str] | None = None) -> int:
             warnings=[],
             errors=[str(exc)],
         )
+        if args is None:
+            print("\n".join(result.errors), file=sys.stderr)
+            return 1
     return print_result(result, bool(args.json_output), module.render_text)
 
 

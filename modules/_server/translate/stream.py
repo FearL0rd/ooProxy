@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import AsyncIterator, Union
+
+logger = logging.getLogger("ooproxy")
 
 
 def _now_iso() -> str:
@@ -20,6 +23,7 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
     eval_count = 0
     prompt_eval_count = 0
     usage_received = False
+    finish_reason_seen: str | None = None
 
     async for raw in sse_stream:
         if isinstance(raw, bytes):
@@ -36,12 +40,13 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
         if payload == "[DONE]":
             if not usage_received:
                 # Emit a done chunk with zero counts as fallback
+                done_reason = finish_reason_seen or "stop"
                 chunk = {
                     "model": model,
                     "created_at": _now_iso(),
                     "message": {"role": "assistant", "content": ""},
                     "done": True,
-                    "done_reason": "stop",
+                    "done_reason": done_reason,
                     "eval_count": 0,
                     "prompt_eval_count": 0,
                     "total_duration": 0,
@@ -89,6 +94,15 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
         content = delta.get("content")
         finish_reason = choice.get("finish_reason")
 
+        # Track finish_reason and warn on non-stop termination
+        if finish_reason:
+            finish_reason_seen = finish_reason
+            if finish_reason != "stop":
+                logger.warning(
+                    "stream ended with finish_reason=%r for model=%s — response may be truncated",
+                    finish_reason, model,
+                )
+
         # Skip finish_reason-only chunks (content is null/None)
         if finish_reason and content is None:
             continue
@@ -102,6 +116,26 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
                 "done": False,
             }
             yield (json.dumps(chunk) + "\n").encode()
+
+    # Stream closed without [DONE] — emit a fallback done chunk so the client
+    # gets a properly terminated NDJSON stream.
+    if not usage_received:
+        done_reason = finish_reason_seen or "stop"
+        logger.debug("stream ended without [DONE], emitting fallback done chunk (reason=%s)", done_reason)
+        chunk = {
+            "model": model,
+            "created_at": _now_iso(),
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": done_reason,
+            "eval_count": 0,
+            "prompt_eval_count": 0,
+            "total_duration": 0,
+            "load_duration": 0,
+            "prompt_eval_duration": 0,
+            "eval_duration": 0,
+        }
+        yield (json.dumps(chunk) + "\n").encode()
 
 
 async def sse_to_generate_ndjson(sse_stream: AsyncIterator[bytes], model: str) -> AsyncIterator[bytes]:

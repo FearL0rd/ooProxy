@@ -370,12 +370,12 @@ def main():
     parser = argparse.ArgumentParser(description="Chat with Ollama models via CLI.")
     parser.add_argument("model", help="The model name to use (e.g., llama3.2)")
     parser.add_argument("-o", "--openai", action="store_true", help="Use OpenAI compatible API endpoint")
-    parser.add_argument("-i", "--ip", default="localhost", help="IP address of the Ollama server (default: localhost)")
-    parser.add_argument("-p", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
+    parser.add_argument("-H", "--host", default="localhost", help="Hostname or IP address of the Ollama server (default: localhost)")
+    parser.add_argument("-P", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
     args = parser.parse_args()
 
     # Construct base URL
-    base_url = f"http://{args.ip}:{args.port}"
+    base_url = f"http://{args.host}:{args.port}"
 
     chat_with_ollama(args.model, base_url, args.openai)
 
