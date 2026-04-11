@@ -7,6 +7,7 @@ These are pure pass-through — same format on both sides — so no translation 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -30,6 +31,16 @@ _TOOL_ERRORS = (
     "tools",
     "function_call",
 )
+
+_STREAM_OPTIONS_ERRORS = (
+    "stream_options",
+    "extra inputs are not permitted",  # pydantic-style rejection of unknown fields
+)
+
+# Seconds to wait for the first streaming byte (response headers) before giving up
+# and retrying the same request as non-streaming.  Models that support streaming
+# respond within a few seconds; models that silently reject it never respond at all.
+_TTFB_TIMEOUT = 30.0
 
 
 def _normalize_messages(body: dict) -> dict:
@@ -67,8 +78,17 @@ def _is_tool_error(exc: Exception) -> bool:
     return any(pattern in msg for pattern in _TOOL_ERRORS)
 
 
+def _is_stream_options_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(pattern in msg for pattern in _STREAM_OPTIONS_ERRORS)
+
+
 def _strip_tools(body: dict) -> dict:
     return {k: v for k, v in body.items() if k not in ("tools", "tool_choice")}
+
+
+def _strip_stream_options(body: dict) -> dict:
+    return {k: v for k, v in body.items() if k != "stream_options"}
 
 
 def _synthetic_stream(model: str, text: str) -> StreamingResponse:
@@ -128,8 +148,9 @@ def _upstream_error_response(exc: Exception, model: str, streaming: bool):
         code = exc.response.status_code
         if 400 <= code < 500:
             status = code
-    logger.error("v1 upstream error for %s: %s", model, exc)
-    return JSONResponse({"error": {"message": str(exc), "type": "upstream_error"}}, status_code=status)
+    msg = str(exc) or f"{type(exc).__name__}"
+    logger.error("v1 upstream error for %s: %s", model, msg)
+    return JSONResponse({"error": {"message": msg, "type": "upstream_error"}}, status_code=status)
 
 
 async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
@@ -151,32 +172,56 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     if streaming:
         # Open upstream eagerly so status is known before we commit to 200 OK.
         # Retry with progressively stripped bodies on known NVIDIA NIM errors.
-        async def _open_stream(b: dict):
-            try:
-                return await client.open_stream_chat(b)
-            except httpx.HTTPStatusError as exc:
-                if _is_tool_error(exc):
-                    logger.info("v1 retrying without tools for model=%s", model)
-                    b = _strip_tools(b)
-                    try:
-                        return await client.open_stream_chat(b), b
-                    except httpx.HTTPStatusError as exc2:
-                        if _is_role_format_error(exc2):
-                            logger.info("v1 retrying with normalized messages for model=%s", model)
-                            return await client.open_stream_chat(_normalize_messages(b)), _normalize_messages(b)
+        # Each transformation is applied at most once; retries continue until no
+        # known error pattern matches or all transformations are exhausted.
+        async def _open_stream(b: dict) -> httpx.Response:
+            stripped_stream_options = False
+            stripped_tools = False
+            normalized = False
+            current = b
+            while True:
+                try:
+                    return await client.open_stream_chat(current)
+                except httpx.HTTPStatusError as exc:
+                    if not stripped_stream_options and _is_stream_options_error(exc):
+                        logger.info("v1 retrying without stream_options for model=%s", model)
+                        current = _strip_stream_options(current)
+                        stripped_stream_options = True
+                    elif not stripped_tools and _is_tool_error(exc):
+                        logger.info("v1 retrying without tools for model=%s", model)
+                        current = _strip_tools(current)
+                        stripped_tools = True
+                    elif not normalized and _is_role_format_error(exc):
+                        logger.info("v1 retrying with normalized messages for model=%s", model)
+                        current = _normalize_messages(current)
+                        normalized = True
+                    else:
                         raise
-                elif _is_role_format_error(exc):
-                    logger.info("v1 retrying with normalized messages for model=%s", model)
-                    return await client.open_stream_chat(_normalize_messages(b)), _normalize_messages(b)
-                raise
 
         try:
-            result = await _open_stream(body)
-            upstream = result[0] if isinstance(result, tuple) else result
+            upstream = await asyncio.wait_for(_open_stream(body), timeout=_TTFB_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Server accepted the connection but never sent response headers — this
+            # model does not support SSE streaming on this backend.  Re-issue as a
+            # plain non-streaming request and wrap the reply in a synthetic stream.
+            logger.warning(
+                "v1 TTFB timeout (>%.0fs) model=%s — falling back to non-streaming",
+                _TTFB_TIMEOUT, model,
+            )
+            fallback = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
+            fallback["stream"] = False
+            try:
+                data = await client.chat(fallback)
+            except Exception as exc:
+                return _upstream_error_response(exc, model, streaming=True)
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return _synthetic_stream(model, content)
         except Exception as exc:
             return _upstream_error_response(exc, model, streaming=True)
 
         async def generate():
+            finish = None
+            usage: dict = {}
             try:
                 async for line in upstream.aiter_lines():
                     if not line:
@@ -185,6 +230,11 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
                         try:
                             chunk = json.loads(line[6:])
                             chunk.pop("nvext", None)
+                            for choice in chunk.get("choices", []):
+                                if choice.get("finish_reason"):
+                                    finish = choice["finish_reason"]
+                            if chunk.get("usage"):
+                                usage = chunk["usage"]
                             yield f"data: {json.dumps(chunk)}\n\n".encode()
                         except json.JSONDecodeError:
                             yield f"{line}\n\n".encode()
@@ -193,31 +243,44 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
             except Exception as exc:
                 logger.error("v1 stream mid-error model=%s: %s", model, exc)
             finally:
+                logger.info("v1 ← model=%s finish=%s prompt=%d compl=%d",
+                            model, finish or "?",
+                            usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
                 await upstream.aclose()
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
+    stripped_stream_options = False
+    stripped_tools = False
+    normalized = False
+    current = body
+    data = None
     try:
-        data = await client.chat(body)
-    except httpx.HTTPStatusError as exc:
-        if _is_tool_error(exc):
-            logger.info("v1 retrying without tools for model=%s", model)
-            body = _strip_tools(body)
+        while data is None:
             try:
-                data = await client.chat(body)
-            except httpx.HTTPStatusError as exc2:
-                if _is_role_format_error(exc2):
+                data = await client.chat(current)
+            except httpx.HTTPStatusError as exc:
+                if not stripped_stream_options and _is_stream_options_error(exc):
+                    logger.info("v1 retrying without stream_options for model=%s", model)
+                    current = _strip_stream_options(current)
+                    stripped_stream_options = True
+                elif not stripped_tools and _is_tool_error(exc):
+                    logger.info("v1 retrying without tools for model=%s", model)
+                    current = _strip_tools(current)
+                    stripped_tools = True
+                elif not normalized and _is_role_format_error(exc):
                     logger.info("v1 retrying with normalized messages for model=%s", model)
-                    data = await client.chat(_normalize_messages(body))
+                    current = _normalize_messages(current)
+                    normalized = True
                 else:
-                    raise exc2
-        elif _is_role_format_error(exc):
-            logger.info("v1 retrying with normalized messages for model=%s", model)
-            data = await client.chat(_normalize_messages(body))
-        else:
-            return _upstream_error_response(exc, model, streaming=False)
+                    return _upstream_error_response(exc, model, streaming=False)
     except Exception as exc:
         return _upstream_error_response(exc, model, streaming=False)
+    usage = data.get("usage") or {}
+    finish = ((data.get("choices") or [{}])[0]).get("finish_reason", "?")
+    logger.info("v1 ← model=%s finish=%s prompt=%d compl=%d",
+                model, finish,
+                usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
     return JSONResponse(data)
 
 

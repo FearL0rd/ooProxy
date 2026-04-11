@@ -101,7 +101,14 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
         for line in response.iter_lines():
             if line:
                 try:
-                    chunk = json.loads(line.decode('utf-8'))
+                    raw = line.decode('utf-8')
+                    if use_openai:
+                        if not raw.startswith('data: '):
+                            continue
+                        raw = raw[6:]
+                        if raw == '[DONE]':
+                            continue
+                    chunk = json.loads(raw)
                     # Handle OpenAI streaming format
                     if use_openai:
                         if chunk.get("choices") and chunk["choices"][0].get("delta"):
@@ -210,7 +217,14 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool):
             for line in response.iter_lines():
                 if line:
                     try:
-                        chunk = json.loads(line.decode('utf-8'))
+                        raw = line.decode('utf-8')
+                        if use_openai:
+                            if not raw.startswith('data: '):
+                                continue
+                            raw = raw[6:]
+                            if raw == '[DONE]':
+                                continue
+                        chunk = json.loads(raw)
                         # Parse OpenAI format
                         if use_openai:
                             if chunk.get("choices"):

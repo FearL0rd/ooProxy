@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -9,7 +11,26 @@ import httpx
 
 from modules._server.config import ProxyConfig
 
-_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
+logger = logging.getLogger("ooproxy")
+_DEBUG = logging.DEBUG
+
+
+def _log_request(body: dict) -> None:
+    if not logger.isEnabledFor(_DEBUG):
+        return
+    raw = json.dumps(body, ensure_ascii=False)
+    preview = raw[:600] + ("…" if len(raw) > 600 else "")
+    logger.debug("upstream → %s", preview)
+
+
+def _log_response(data: dict) -> None:
+    if not logger.isEnabledFor(_DEBUG):
+        return
+    raw = json.dumps(data, ensure_ascii=False)
+    preview = raw[:600] + ("…" if len(raw) > 600 else "")
+    logger.debug("upstream ← %s", preview)
+
+_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
 
 
 def _strip_vendor(data: dict) -> dict:
@@ -35,13 +56,16 @@ class OpenAIClient:
 
     async def chat(self, body: dict) -> dict:
         """POST /v1/chat/completions (non-streaming)."""
+        _log_request(body)
         r = await self._client.post(
             f"{self._base}/chat/completions",
             json=body,
-            headers=self._headers,
+            headers={**self._headers, "Accept": "application/json"},
         )
         r.raise_for_status()
-        return _strip_vendor(r.json())
+        data = _strip_vendor(r.json())
+        _log_response(data)
+        return data
 
     @asynccontextmanager
     async def stream_chat(self, body: dict):
@@ -50,6 +74,7 @@ class OpenAIClient:
         Yields an async iterator of SSE lines as strings.
         Use as: async with client.stream_chat(body) as lines: ...
         """
+        _log_request(body)
         async with self._client.stream(
             "POST",
             f"{self._base}/chat/completions",
@@ -66,6 +91,7 @@ class OpenAIClient:
         The caller MUST call response.aclose() when done (use try/finally).
         Raises httpx.HTTPStatusError if the remote returns a non-2xx status.
         """
+        _log_request(body)
         request = self._client.build_request(
             "POST",
             f"{self._base}/chat/completions",
