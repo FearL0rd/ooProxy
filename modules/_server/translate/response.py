@@ -179,3 +179,56 @@ def openai_chat_to_responses(
 
     assistant_messages = [message]
     return response, assistant_messages
+
+
+def anthropic_stop_reason(finish_reason: str | None) -> str | None:
+    if finish_reason == "tool_calls":
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    if finish_reason in {None, "stop"}:
+        return "end_turn"
+    return finish_reason
+
+
+def openai_chat_to_anthropic_message(data: dict, request_body: dict) -> dict:
+    """Convert a non-streaming OpenAI chat completion to an Anthropic message."""
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {"role": "assistant", "content": ""}
+    usage = data.get("usage") or {}
+
+    content_blocks: list[dict] = []
+    text = message.get("content") or ""
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") or {}
+        arguments = function.get("arguments") or "{}"
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed_arguments = {"_raw": arguments}
+        else:
+            parsed_arguments = arguments
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tool_call.get("id") or f"toolu_{uuid.uuid4().hex}",
+            "name": function.get("name", "unknown_tool"),
+            "input": parsed_arguments if isinstance(parsed_arguments, dict) else {"value": parsed_arguments},
+        })
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex}",
+        "type": "message",
+        "role": "assistant",
+        "model": request_body["model"],
+        "content": content_blocks,
+        "stop_reason": anthropic_stop_reason(choice.get("finish_reason")),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }

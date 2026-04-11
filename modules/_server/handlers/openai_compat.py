@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -21,7 +22,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 logger = logging.getLogger("ooproxy")
 
 from modules._server.translate.request import responses_to_openai_chat
-from modules._server.translate.response import openai_chat_to_responses
+from modules._server.translate.request import anthropic_messages_to_openai_chat
+from modules._server.translate.response import openai_chat_to_anthropic_message, openai_chat_to_responses
 
 
 _ROLE_FORMAT_ERRORS = (
@@ -93,6 +95,146 @@ def _strip_tools(body: dict) -> dict:
 
 def _strip_stream_options(body: dict) -> dict:
     return {k: v for k, v in body.items() if k != "stream_options"}
+
+
+def _should_disable_anthropic_tools(body: dict) -> bool:
+    mode = os.environ.get("OOPROXY_ANTHROPIC_TOOL_PASSTHROUGH", "auto").strip().lower()
+    if mode in {"1", "true", "on", "enabled", "allow", "passthrough"}:
+        return False
+    if mode in {"0", "false", "off", "disabled", "deny", "disable"}:
+        return True
+
+    if not body.get("tools"):
+        return False
+
+    model = str(body.get("model") or "").lower()
+    if "claude" in model or "anthropic" in model:
+        return False
+
+    latest_user_text = _anthropic_latest_user_text(body)
+    return _looks_like_trivial_greeting(latest_user_text)
+
+
+def _anthropic_latest_user_text(body: dict) -> str:
+    messages = body.get("messages") or []
+    for item in reversed(messages):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content.strip().lower()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            return "\n".join(parts).strip().lower()
+    return ""
+
+
+def _looks_like_trivial_greeting(text: str) -> bool:
+    if not text:
+        return False
+
+    normalized = " ".join(text.split())
+    greeting_phrases = {
+        "hi",
+        "hello",
+        "hello there",
+        "hey",
+        "hey there",
+        "yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "ok",
+        "okay",
+        "test",
+        "testing",
+    }
+    if normalized in greeting_phrases:
+        return True
+
+    actionable_tokens = (
+        "list",
+        "show",
+        "find",
+        "read",
+        "open",
+        "run",
+        "execute",
+        "search",
+        "grep",
+        "edit",
+        "write",
+        "create",
+        "delete",
+        "remove",
+        "rename",
+        "move",
+        "copy",
+        "fix",
+        "debug",
+        "files",
+        "folder",
+        "directory",
+        "cwd",
+        "current folder",
+        "current directory",
+    )
+    return not any(token in normalized for token in actionable_tokens)
+
+
+async def _open_stream_with_retries(client, body: dict, model: str) -> tuple[httpx.Response, dict]:
+    stripped_stream_options = False
+    stripped_tools = False
+    normalized = False
+    current = body
+    while True:
+        try:
+            return await client.open_stream_chat(current), current
+        except httpx.HTTPStatusError as exc:
+            if not stripped_stream_options and _is_stream_options_error(exc):
+                logger.info("v1 retrying without stream_options for model=%s", model)
+                current = _strip_stream_options(current)
+                stripped_stream_options = True
+            elif not stripped_tools and _is_tool_error(exc):
+                logger.info("v1 retrying without tools for model=%s", model)
+                current = _strip_tools(current)
+                stripped_tools = True
+            elif not normalized and _is_role_format_error(exc):
+                logger.info("v1 retrying with normalized messages for model=%s", model)
+                current = _normalize_messages(current)
+                normalized = True
+            else:
+                raise
+
+
+async def _chat_with_retries(client, body: dict, model: str) -> tuple[dict, dict]:
+    stripped_stream_options = False
+    stripped_tools = False
+    normalized = False
+    current = body
+    while True:
+        try:
+            return await client.chat(current), current
+        except httpx.HTTPStatusError as exc:
+            if not stripped_stream_options and _is_stream_options_error(exc):
+                logger.info("v1 retrying without stream_options for model=%s", model)
+                current = _strip_stream_options(current)
+                stripped_stream_options = True
+            elif not stripped_tools and _is_tool_error(exc):
+                logger.info("v1 retrying without tools for model=%s", model)
+                current = _strip_tools(current)
+                stripped_tools = True
+            elif not normalized and _is_role_format_error(exc):
+                logger.info("v1 retrying with normalized messages for model=%s", model)
+                current = _normalize_messages(current)
+                normalized = True
+            else:
+                raise
 
 
 def _responses_store(request: Request) -> dict[str, list[dict]]:
@@ -366,6 +508,167 @@ def _responses_error_response(exc: Exception) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": "upstream_error"}}, status_code=status)
 
 
+async def _responses_error_stream(message: str) -> AsyncIterator[bytes]:
+    yield _response_error_event(message)
+
+
+async def _responses_failed_stream(
+    request_body: dict,
+    response_id: str,
+    *,
+    previous_response_id: str | None,
+    message: str,
+    code: str = "upstream_error",
+) -> AsyncIterator[bytes]:
+    created_at = int(time.time())
+    failed_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": None,
+        "status": "failed",
+        "error": {"code": code, "message": message},
+        "incomplete_details": None,
+        "instructions": request_body.get("instructions"),
+        "max_output_tokens": request_body.get("max_output_tokens"),
+        "model": request_body["model"],
+        "output": [],
+        "parallel_tool_calls": bool(request_body.get("parallel_tool_calls", True)),
+        "previous_response_id": previous_response_id,
+        "reasoning": request_body.get("reasoning") or {"effort": None, "summary": None},
+        "store": bool(request_body.get("store", True)),
+        "temperature": request_body.get("temperature", 1),
+        "text": request_body.get("text") or {"format": {"type": "text"}},
+        "tool_choice": request_body.get("tool_choice", "auto"),
+        "tools": request_body.get("tools") or [],
+        "top_p": request_body.get("top_p", 1),
+        "truncation": request_body.get("truncation", "disabled"),
+        "usage": None,
+        "user": request_body.get("user"),
+        "metadata": request_body.get("metadata") or {},
+    }
+    yield _response_event("response.created", {"response": {**failed_response, "status": "in_progress", "error": None}, "sequence_number": 1})
+    yield _response_event("response.in_progress", {"response": {**failed_response, "status": "in_progress", "error": None}, "sequence_number": 2})
+    yield _response_error_event(message, code=code, sequence_number=3)
+    yield _response_event("response.failed", {"response": failed_response, "sequence_number": 4})
+
+
+async def _responses_synthetic_stream(response_payload: dict) -> AsyncIterator[bytes]:
+    seq = 1
+    yield _response_event(
+        "response.created",
+        {"response": {**response_payload, "status": "in_progress", "completed_at": None, "usage": None, "output": []}, "sequence_number": seq},
+    )
+    seq += 1
+    for item_index, item in enumerate(response_payload.get("output") or []):
+        yield _response_event("response.output_item.added", {"output_index": item_index, "item": item, "sequence_number": seq})
+        seq += 1
+        if item.get("type") == "message":
+            content = ((item.get("content") or [{}])[0]).get("text", "")
+            yield _response_event(
+                "response.content_part.added",
+                {
+                    "item_id": item["id"],
+                    "output_index": item_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "sequence_number": seq,
+                },
+            )
+            seq += 1
+            if content:
+                yield _response_event(
+                    "response.output_text.delta",
+                    {
+                        "item_id": item["id"],
+                        "output_index": item_index,
+                        "content_index": 0,
+                        "delta": content,
+                        "sequence_number": seq,
+                    },
+                )
+                seq += 1
+                yield _response_event(
+                    "response.output_text.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": item_index,
+                        "content_index": 0,
+                        "text": content,
+                        "sequence_number": seq,
+                    },
+                )
+                seq += 1
+                yield _response_event(
+                    "response.content_part.done",
+                    {
+                        "item_id": item["id"],
+                        "output_index": item_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": content, "annotations": []},
+                        "sequence_number": seq,
+                    },
+                )
+                seq += 1
+        elif item.get("type") == "function_call":
+            yield _response_event(
+                "response.function_call_arguments.done",
+                {
+                    "item_id": item["id"],
+                    "output_index": item_index,
+                    "name": item.get("name", "unknown_tool"),
+                    "arguments": item.get("arguments", ""),
+                    "sequence_number": seq,
+                },
+            )
+            seq += 1
+        yield _response_event("response.output_item.done", {"output_index": item_index, "item": item, "sequence_number": seq})
+        seq += 1
+    yield _response_event("response.completed", {"response": response_payload, "sequence_number": seq})
+
+
+def _anthropic_event(event_type: str, payload: dict) -> bytes:
+    body = {"type": event_type, **payload}
+    return f"event: {event_type}\ndata: {json.dumps(body)}\n\n".encode()
+
+
+async def _anthropic_synthetic_stream(message_payload: dict) -> AsyncIterator[bytes]:
+    seq_usage = message_payload.get("usage") or {"input_tokens": 0, "output_tokens": 0}
+    yield _anthropic_event("message_start", {"message": {**message_payload, "content": [], "stop_reason": None}})
+    for index, block in enumerate(message_payload.get("content") or []):
+        if block.get("type") == "text":
+            yield _anthropic_event("content_block_start", {"index": index, "content_block": {"type": "text", "text": ""}})
+            text = block.get("text") or ""
+            if text:
+                yield _anthropic_event("content_block_delta", {"index": index, "delta": {"type": "text_delta", "text": text}})
+            yield _anthropic_event("content_block_stop", {"index": index})
+        elif block.get("type") == "tool_use":
+            yield _anthropic_event(
+                "content_block_start",
+                {
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": {},
+                    },
+                },
+            )
+            partial_json = json.dumps(block.get("input") or {}, ensure_ascii=False)
+            yield _anthropic_event("content_block_delta", {"index": index, "delta": {"type": "input_json_delta", "partial_json": partial_json}})
+            yield _anthropic_event("content_block_stop", {"index": index})
+
+    yield _anthropic_event(
+        "message_delta",
+        {
+            "delta": {"stop_reason": message_payload.get("stop_reason"), "stop_sequence": None},
+            "usage": {"output_tokens": seq_usage.get("output_tokens", 0)},
+        },
+    )
+    yield _anthropic_event("message_stop", {})
+
+
 def _synthetic_stream(model: str, text: str) -> StreamingResponse:
     """Return a fake streaming chat completion that renders as an assistant message in VS Code."""
     cid = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -445,36 +748,8 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
         logger.debug("  msg[%d] role=%s: %s", i, role, preview)
 
     if streaming:
-        # Open upstream eagerly so status is known before we commit to 200 OK.
-        # Retry with progressively stripped bodies on known NVIDIA NIM errors.
-        # Each transformation is applied at most once; retries continue until no
-        # known error pattern matches or all transformations are exhausted.
-        async def _open_stream(b: dict) -> httpx.Response:
-            stripped_stream_options = False
-            stripped_tools = False
-            normalized = False
-            current = b
-            while True:
-                try:
-                    return await client.open_stream_chat(current)
-                except httpx.HTTPStatusError as exc:
-                    if not stripped_stream_options and _is_stream_options_error(exc):
-                        logger.info("v1 retrying without stream_options for model=%s", model)
-                        current = _strip_stream_options(current)
-                        stripped_stream_options = True
-                    elif not stripped_tools and _is_tool_error(exc):
-                        logger.info("v1 retrying without tools for model=%s", model)
-                        current = _strip_tools(current)
-                        stripped_tools = True
-                    elif not normalized and _is_role_format_error(exc):
-                        logger.info("v1 retrying with normalized messages for model=%s", model)
-                        current = _normalize_messages(current)
-                        normalized = True
-                    else:
-                        raise
-
         try:
-            upstream = await asyncio.wait_for(_open_stream(body), timeout=_TTFB_TIMEOUT)
+            upstream, _ = await asyncio.wait_for(_open_stream_with_retries(client, body, model), timeout=_TTFB_TIMEOUT)
         except asyncio.TimeoutError:
             # Server accepted the connection but never sent response headers — this
             # model does not support SSE streaming on this backend.  Re-issue as a
@@ -486,7 +761,7 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
             fallback = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
             fallback["stream"] = False
             try:
-                data = await client.chat(fallback)
+                data, _ = await _chat_with_retries(client, fallback, model)
             except Exception as exc:
                 return _upstream_error_response(exc, model, streaming=True)
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -531,24 +806,9 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     current = body
     data = None
     try:
-        while data is None:
-            try:
-                data = await client.chat(current)
-            except httpx.HTTPStatusError as exc:
-                if not stripped_stream_options and _is_stream_options_error(exc):
-                    logger.info("v1 retrying without stream_options for model=%s", model)
-                    current = _strip_stream_options(current)
-                    stripped_stream_options = True
-                elif not stripped_tools and _is_tool_error(exc):
-                    logger.info("v1 retrying without tools for model=%s", model)
-                    current = _strip_tools(current)
-                    stripped_tools = True
-                elif not normalized and _is_role_format_error(exc):
-                    logger.info("v1 retrying with normalized messages for model=%s", model)
-                    current = _normalize_messages(current)
-                    normalized = True
-                else:
-                    return _upstream_error_response(exc, model, streaming=False)
+        data, current = await _chat_with_retries(client, current, model)
+    except httpx.HTTPStatusError as exc:
+        return _upstream_error_response(exc, model, streaming=False)
     except Exception as exc:
         return _upstream_error_response(exc, model, streaming=False)
     usage = data.get("usage") or {}
@@ -591,72 +851,45 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
                 model, bool(body.get("stream")), previous_response_id or "-",
                 type(body.get("input")).__name__)
 
-    if body.get("stream"):
+    async def _synthetic_from_chat(chat_request_body: dict) -> StreamingResponse | None:
+        fallback = {k: v for k, v in chat_request_body.items() if k not in ("stream", "stream_options")}
+        fallback["stream"] = False
         try:
-            upstream = await asyncio.wait_for(client.open_stream_chat(chat_body), timeout=_TTFB_TIMEOUT)
-        except asyncio.TimeoutError:
-            fallback = {k: v for k, v in chat_body.items() if k not in ("stream", "stream_options")}
-            fallback["stream"] = False
-            try:
-                data = await client.chat(fallback)
-            except Exception as exc:
-                async def error_stream():
-                    yield _response_error_event(str(exc))
-                return StreamingResponse(error_stream(), media_type="text/event-stream")
-
-            response_payload, assistant_messages = openai_chat_to_responses(
-                data,
-                body,
-                response_id,
-                previous_response_id=previous_response_id,
-            )
-            _remember_response(request, response_id, [*input_messages, *assistant_messages])
-
-            async def synthetic_stream():
-                seq = 1
-                yield _response_event("response.created", {"response": {**response_payload, "status": "in_progress", "completed_at": None, "usage": None, "output": []}, "sequence_number": seq})
-                seq += 1
-                for item_index, item in enumerate(response_payload.get("output") or []):
-                    yield _response_event("response.output_item.added", {"output_index": item_index, "item": item, "sequence_number": seq})
-                    seq += 1
-                    if item.get("type") == "message":
-                        content = ((item.get("content") or [{}])[0]).get("text", "")
-                        yield _response_event("response.content_part.added", {"item_id": item["id"], "output_index": item_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}, "sequence_number": seq})
-                        seq += 1
-                        if content:
-                            yield _response_event("response.output_text.delta", {"item_id": item["id"], "output_index": item_index, "content_index": 0, "delta": content, "sequence_number": seq})
-                            seq += 1
-                            yield _response_event("response.output_text.done", {"item_id": item["id"], "output_index": item_index, "content_index": 0, "text": content, "sequence_number": seq})
-                            seq += 1
-                            yield _response_event("response.content_part.done", {"item_id": item["id"], "output_index": item_index, "content_index": 0, "part": {"type": "output_text", "text": content, "annotations": []}, "sequence_number": seq})
-                            seq += 1
-                    elif item.get("type") == "function_call":
-                        yield _response_event("response.function_call_arguments.done", {"item_id": item["id"], "output_index": item_index, "name": item.get("name", "unknown_tool"), "arguments": item.get("arguments", ""), "sequence_number": seq})
-                        seq += 1
-                    yield _response_event("response.output_item.done", {"output_index": item_index, "item": item, "sequence_number": seq})
-                    seq += 1
-                yield _response_event("response.completed", {"response": response_payload, "sequence_number": seq})
-
-            return StreamingResponse(synthetic_stream(), media_type="text/event-stream")
+            data, effective_nonstream_body = await _chat_with_retries(client, fallback, model)
         except Exception as exc:
-            async def error_stream():
-                yield _response_error_event(str(exc))
-            return StreamingResponse(error_stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                _responses_failed_stream(
+                    body,
+                    response_id,
+                    previous_response_id=previous_response_id,
+                    message=str(exc) or type(exc).__name__,
+                ),
+                media_type="text/event-stream",
+            )
 
-        return StreamingResponse(
-            _chat_sse_to_responses_sse(
-                upstream,
-                request_body=body,
-                response_id=response_id,
-                previous_response_id=previous_response_id,
-                input_messages=input_messages,
-                request=request,
-            ),
-            media_type="text/event-stream",
+        response_payload, assistant_messages = openai_chat_to_responses(
+            data,
+            body,
+            response_id,
+            previous_response_id=previous_response_id,
         )
+        _remember_response(
+            request,
+            response_id,
+            [*effective_nonstream_body.get("messages", input_messages), *assistant_messages],
+        )
+        return StreamingResponse(_responses_synthetic_stream(response_payload), media_type="text/event-stream")
+
+    if body.get("stream"):
+        logger.info("v1/responses using synthetic stream for model=%s", model)
+        synthetic = await _synthetic_from_chat(chat_body)
+        if synthetic is not None:
+            return synthetic
 
     try:
-        data = await client.chat(chat_body)
+        data, effective_chat_body = await _chat_with_retries(client, chat_body, model)
+    except httpx.HTTPStatusError as exc:
+        return _responses_error_response(exc)
     except Exception as exc:
         return _responses_error_response(exc)
 
@@ -666,5 +899,39 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
         response_id,
         previous_response_id=previous_response_id,
     )
-    _remember_response(request, response_id, [*input_messages, *assistant_messages])
+    _remember_response(request, response_id, [*effective_chat_body.get("messages", input_messages), *assistant_messages])
     return JSONResponse(response_payload)
+
+
+async def v1_messages_handler(request: Request) -> StreamingResponse | JSONResponse:
+    """POST /v1/messages — Anthropic Messages compatibility layer."""
+    body = await request.json()
+    client = request.app.state.client
+    model = body.get("model", "?")
+    chat_body = anthropic_messages_to_openai_chat(body)
+
+    if _should_disable_anthropic_tools(body):
+        if "tools" in chat_body or "tool_choice" in chat_body:
+            logger.info("v1/messages suppressing Anthropic tools for model=%s", model)
+        chat_body = _strip_tools(chat_body)
+
+    logger.info("v1/messages model=%s stream=%s msgs=%d tools=%s",
+                model, bool(body.get("stream")), len(body.get("messages", [])),
+                bool(body.get("tools")) and "tools" in chat_body)
+
+    fallback = {k: v for k, v in chat_body.items() if k not in ("stream", "stream_options")}
+    fallback["stream"] = False
+    try:
+        data, _ = await _chat_with_retries(client, fallback, model)
+    except Exception as exc:
+        error_message = str(exc) or type(exc).__name__
+        if body.get("stream"):
+            async def anthropic_error_stream():
+                yield _anthropic_event("error", {"error": {"type": "api_error", "message": error_message}})
+            return StreamingResponse(anthropic_error_stream(), media_type="text/event-stream")
+        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": error_message}}, status_code=502)
+
+    anthropic_message = openai_chat_to_anthropic_message(data, body)
+    if body.get("stream"):
+        return StreamingResponse(_anthropic_synthetic_stream(anthropic_message), media_type="text/event-stream")
+    return JSONResponse(anthropic_message)

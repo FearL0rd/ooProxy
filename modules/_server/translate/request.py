@@ -235,6 +235,57 @@ def _responses_input_to_messages(input_value: object) -> list[dict]:
     return []
 
 
+def _responses_tools_to_openai(tools: object) -> list[dict] | None:
+    if not isinstance(tools, list):
+        return None
+
+    converted: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            converted.append(tool)
+            continue
+
+        tool_type = tool.get("type")
+        name = tool.get("name")
+        parameters = tool.get("parameters")
+        if tool_type == "function" and isinstance(name, str) and name:
+            converted_tool = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}, "required": []},
+                },
+            }
+            if "strict" in tool:
+                converted_tool["function"]["strict"] = bool(tool.get("strict"))
+            converted.append(converted_tool)
+
+    return converted or None
+
+
+def _responses_tool_choice_to_openai(tool_choice: object) -> object:
+    if isinstance(tool_choice, str):
+        if tool_choice == "required":
+            return "required"
+        return tool_choice
+
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+
+    choice_type = tool_choice.get("type")
+    if choice_type in {"auto", "none", "required"}:
+        return choice_type
+    if choice_type == "function" and tool_choice.get("name"):
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    if choice_type == "custom" and tool_choice.get("name"):
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    return tool_choice
+
+
 def responses_to_openai_chat(body: dict, previous_messages: list[dict] | None = None) -> tuple[dict, list[dict]]:
     """Convert an OpenAI /v1/responses request to /v1/chat/completions."""
     messages = [dict(message) for message in (previous_messages or [])]
@@ -250,10 +301,11 @@ def responses_to_openai_chat(body: dict, previous_messages: list[dict] | None = 
         "messages": messages,
         "stream": bool(body.get("stream", False)),
     }
-    if body.get("tools") is not None:
-        out["tools"] = body["tools"]
+    converted_tools = _responses_tools_to_openai(body.get("tools"))
+    if converted_tools is not None:
+        out["tools"] = converted_tools
     if body.get("tool_choice") is not None:
-        out["tool_choice"] = body["tool_choice"]
+        out["tool_choice"] = _responses_tool_choice_to_openai(body["tool_choice"])
     if out["stream"]:
         out["stream_options"] = {"include_usage": True}
     if body.get("temperature") is not None:
@@ -269,3 +321,132 @@ def responses_to_openai_chat(body: dict, previous_messages: list[dict] | None = 
     if "max_tokens" not in out:
         out["max_tokens"] = _DEFAULT_MAX_TOKENS
     return out, messages
+
+
+def _anthropic_text_from_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(part for part in parts if part)
+
+
+def anthropic_messages_to_openai_chat(body: dict) -> dict:
+    """Convert Anthropic /v1/messages requests to OpenAI /v1/chat/completions."""
+    messages: list[dict] = []
+
+    system = body.get("system")
+    if isinstance(system, str) and system:
+        messages.append({"role": "system", "content": system})
+    elif isinstance(system, list):
+        system_text = _anthropic_text_from_content(system)
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+    for item in body.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "user")
+        content = item.get("content")
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+
+        if not isinstance(content, list):
+            messages.append({"role": role, "content": ""})
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[dict] = []
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+            elif block_type == "tool_use":
+                arguments = block.get("input", {})
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                tool_calls.append({
+                    "id": block.get("id") or f"toolu_{block_index}",
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", "unknown_tool"),
+                        "arguments": arguments,
+                    },
+                })
+            elif block_type == "tool_result":
+                result_content = block.get("content", "")
+                if isinstance(result_content, list):
+                    result_content = _anthropic_text_from_content(result_content)
+                elif not isinstance(result_content, str):
+                    result_content = json.dumps(result_content, ensure_ascii=False)
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id") or f"toolu_{block_index}",
+                    "content": result_content,
+                })
+
+        if role == "assistant":
+            message = {"role": "assistant", "content": "\n".join(part for part in text_parts if part)}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
+        elif text_parts:
+            messages.append({"role": role, "content": "\n".join(part for part in text_parts if part)})
+
+        messages.extend(tool_results)
+
+    out: dict = {
+        "model": body["model"],
+        "messages": messages,
+        "stream": bool(body.get("stream", False)),
+        "max_tokens": body.get("max_tokens") or _DEFAULT_MAX_TOKENS,
+    }
+
+    if body.get("temperature") is not None:
+        out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        converted_tools = []
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+            converted_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}, "required": []},
+                },
+            })
+        if converted_tools:
+            out["tools"] = converted_tools
+
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if choice_type == "auto":
+            out["tool_choice"] = "auto"
+        elif choice_type == "any":
+            out["tool_choice"] = "required"
+        elif choice_type == "tool" and tool_choice.get("name"):
+            out["tool_choice"] = {"type": "function", "function": {"name": tool_choice["name"]}}
+        elif choice_type == "none":
+            out["tool_choice"] = "none"
+
+    if out["stream"]:
+        out["stream_options"] = {"include_usage": True}
+    return out
