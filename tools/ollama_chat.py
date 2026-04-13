@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -22,6 +23,7 @@ CONTEXT_FILE = ""
 HISTORY_FILE = ""
 LOCK_FILE = ""
 CURRENT_SESSION_ID = ""
+LAUNCH_COMMAND_PREFIX = ""
 
 ATTACHMENT_BUFFER: List[str] = []
 DEFAULT_TOOL_TIMEOUT = 120
@@ -222,6 +224,34 @@ def _init_session_paths(session_id: str) -> None:
 # When True, we're resuming an existing conversation and should
 # avoid printing the startup banner.
 CONTINUE_SESSION = False
+
+
+def _looks_like_chat_script(path: str) -> bool:
+    return os.path.basename(path) == "ollama_chat.py"
+
+
+def _capture_launch_command_prefix() -> None:
+    global LAUNCH_COMMAND_PREFIX
+
+    orig_argv = getattr(sys, "orig_argv", []) or []
+    if len(orig_argv) >= 2 and _looks_like_chat_script(orig_argv[1]):
+        LAUNCH_COMMAND_PREFIX = " ".join(shlex.quote(part) for part in orig_argv[:2])
+        return
+
+    argv0 = sys.argv[0] if sys.argv else ""
+    if _looks_like_chat_script(argv0):
+        LAUNCH_COMMAND_PREFIX = f"python {shlex.quote(argv0)}"
+        return
+
+    LAUNCH_COMMAND_PREFIX = f"python {shlex.quote(os.path.basename(__file__))}"
+
+
+def _resume_model(active_model: str = "") -> str:
+    if active_model:
+        return active_model
+    if CURRENT_SESSION_ID:
+        return str(_read_session_meta(CURRENT_SESSION_ID).get("model", "")).strip()
+    return ""
 
 
 def render_markdown_to_terminal(text: str, console: Any = None) -> None:
@@ -1233,10 +1263,11 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
         print(f"❌ Compact failed: {e}")
         return messages
 
-def _print_resume_hint() -> None:
+def _print_resume_hint(active_model: str = "") -> None:
     if CURRENT_SESSION_ID:
-        script = os.path.basename(__file__)
-        print(f"💡 To resume: python {script} <model> -r {CURRENT_SESSION_ID}")
+        model = _resume_model(active_model) or "<model>"
+        prefix = LAUNCH_COMMAND_PREFIX or f"python {shlex.quote(os.path.basename(__file__))}"
+        print(f"💡 To resume: {prefix} {shlex.quote(model)} -r {shlex.quote(CURRENT_SESSION_ID)}")
 
 
 def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: bool, render_mode: str, guardrails_mode: str):
@@ -1321,7 +1352,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                     print("🗑️ Context file removed (no messages to save). Goodbye!")
                 elif saved_count > 0:
                     print(f"💾 Context saved ({saved_count} messages). Goodbye!")
-                    _print_resume_hint()
+                    _print_resume_hint(model)
                 else:
                     print("⚠️ Context could not be saved. Goodbye!")
                 break
@@ -1531,7 +1562,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
 
         except requests.exceptions.ConnectionError:
             print(f"\n❌ Could not connect to server at {base_url}. Is it running?")
-            _print_resume_hint()
+            _print_resume_hint(model)
             break
         except KeyboardInterrupt:
             saved_count = save_context(messages)
@@ -1539,7 +1570,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 print("\n\n👋 Chat ended. Context file removed (no messages to save).")
             elif saved_count > 0:
                 print(f"\n\n👋 Chat ended. Context saved ({saved_count} messages).")
-                _print_resume_hint()
+                _print_resume_hint(model)
             else:
                 print("\n\n👋 Chat ended. Context could not be saved.")
             break
@@ -1547,6 +1578,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
             print(f"\n❌ Error: {e}")
 
 def main():
+    _capture_launch_command_prefix()
     parser = argparse.ArgumentParser(description="Chat with Ollama models via CLI.")
     parser.add_argument("model", help="The model name to use (e.g., llama3.2)")
     parser.add_argument("-o", "--openai", action="store_true", help="Use OpenAI compatible API endpoint")
