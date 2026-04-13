@@ -139,11 +139,14 @@ def print_result(result: ResultEnvelope, json_output: bool, render_text) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = None
+    module = None
+    render_text = lambda r: ""  # noqa: E731  — fallback before module is known
     try:
         modules = discover_modules()
         parser, _ = build_parser(modules)
         args = parser.parse_args(argv)
         module = modules[args.selected_module]
+        render_text = module.render_text
         spec: ModuleSpec = module.SPEC
         validate_required_options(args, spec)
         result: ResultEnvelope = module.run(args)
@@ -164,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         if args is None:
             print("\n".join(result.errors), file=sys.stderr)
             return 1
-    return print_result(result, bool(args.json_output), module.render_text)
+    return print_result(result, bool(args.json_output), render_text)
 
 
 if __name__ == "__main__":

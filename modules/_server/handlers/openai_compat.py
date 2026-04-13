@@ -187,11 +187,26 @@ def _looks_like_trivial_greeting(text: str) -> bool:
     return not any(token in normalized for token in actionable_tokens)
 
 
-async def _open_stream_with_retries(client, body: dict, model: str) -> tuple[httpx.Response, dict]:
-    stripped_stream_options = False
-    stripped_tools = False
-    normalized = False
+def _apply_cached_flags(body: dict, flags: dict[str, bool]) -> dict:
+    """Pre-apply known behavioral quirks from the cache so we skip trial-and-error."""
     current = body
+    if flags.get("strip_stream_options"):
+        current = _strip_stream_options(current)
+    if flags.get("strip_tools"):
+        current = _strip_tools(current)
+    if flags.get("normalize_messages"):
+        current = _normalize_messages(current)
+    return current
+
+
+async def _open_stream_with_retries(
+    client, body: dict, model: str, behavior=None, base_url: str = ""
+) -> tuple[httpx.Response, dict]:
+    flags = behavior.get_flags(base_url, model) if behavior else {}
+    current = _apply_cached_flags(body, flags)
+    stripped_stream_options = flags.get("strip_stream_options", False)
+    stripped_tools = flags.get("strip_tools", False)
+    normalized = flags.get("normalize_messages", False)
     while True:
         try:
             return await client.open_stream_chat(current), current
@@ -200,23 +215,32 @@ async def _open_stream_with_retries(client, body: dict, model: str) -> tuple[htt
                 logger.info("v1 retrying without stream_options for model=%s", model)
                 current = _strip_stream_options(current)
                 stripped_stream_options = True
+                if behavior:
+                    await behavior.record(base_url, model, "strip_stream_options")
             elif not stripped_tools and _is_tool_error(exc):
                 logger.info("v1 retrying without tools for model=%s", model)
                 current = _strip_tools(current)
                 stripped_tools = True
+                if behavior:
+                    await behavior.record(base_url, model, "strip_tools")
             elif not normalized and _is_role_format_error(exc):
                 logger.info("v1 retrying with normalized messages for model=%s", model)
                 current = _normalize_messages(current)
                 normalized = True
+                if behavior:
+                    await behavior.record(base_url, model, "normalize_messages")
             else:
                 raise
 
 
-async def _chat_with_retries(client, body: dict, model: str) -> tuple[dict, dict]:
-    stripped_stream_options = False
-    stripped_tools = False
-    normalized = False
-    current = body
+async def _chat_with_retries(
+    client, body: dict, model: str, behavior=None, base_url: str = ""
+) -> tuple[dict, dict]:
+    flags = behavior.get_flags(base_url, model) if behavior else {}
+    current = _apply_cached_flags(body, flags)
+    stripped_stream_options = flags.get("strip_stream_options", False)
+    stripped_tools = flags.get("strip_tools", False)
+    normalized = flags.get("normalize_messages", False)
     while True:
         try:
             return await client.chat(current), current
@@ -225,14 +249,20 @@ async def _chat_with_retries(client, body: dict, model: str) -> tuple[dict, dict
                 logger.info("v1 retrying without stream_options for model=%s", model)
                 current = _strip_stream_options(current)
                 stripped_stream_options = True
+                if behavior:
+                    await behavior.record(base_url, model, "strip_stream_options")
             elif not stripped_tools and _is_tool_error(exc):
                 logger.info("v1 retrying without tools for model=%s", model)
                 current = _strip_tools(current)
                 stripped_tools = True
+                if behavior:
+                    await behavior.record(base_url, model, "strip_tools")
             elif not normalized and _is_role_format_error(exc):
                 logger.info("v1 retrying with normalized messages for model=%s", model)
                 current = _normalize_messages(current)
                 normalized = True
+                if behavior:
+                    await behavior.record(base_url, model, "normalize_messages")
             else:
                 raise
 
@@ -735,6 +765,8 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     """POST /v1/chat/completions — OpenAI-format pass-through."""
     body = await request.json()
     client = request.app.state.client
+    behavior = getattr(request.app.state, "behavior", None)
+    base_url = getattr(request.app.state, "base_url", "")
     streaming = body.get("stream", False)
     model = body.get("model", "?")
 
@@ -749,7 +781,10 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
 
     if streaming:
         try:
-            upstream, _ = await asyncio.wait_for(_open_stream_with_retries(client, body, model), timeout=_TTFB_TIMEOUT)
+            upstream, _ = await asyncio.wait_for(
+                _open_stream_with_retries(client, body, model, behavior=behavior, base_url=base_url),
+                timeout=_TTFB_TIMEOUT,
+            )
         except asyncio.TimeoutError:
             # Server accepted the connection but never sent response headers — this
             # model does not support SSE streaming on this backend.  Re-issue as a
@@ -761,7 +796,7 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
             fallback = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
             fallback["stream"] = False
             try:
-                data, _ = await _chat_with_retries(client, fallback, model)
+                data, _ = await _chat_with_retries(client, fallback, model, behavior=behavior, base_url=base_url)
             except Exception as exc:
                 return _upstream_error_response(exc, model, streaming=True)
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -800,13 +835,9 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    stripped_stream_options = False
-    stripped_tools = False
-    normalized = False
     current = body
-    data = None
     try:
-        data, current = await _chat_with_retries(client, current, model)
+        data, current = await _chat_with_retries(client, current, model, behavior=behavior, base_url=base_url)
     except httpx.HTTPStatusError as exc:
         return _upstream_error_response(exc, model, streaming=False)
     except Exception as exc:
@@ -838,6 +869,8 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
     """POST /v1/responses — translate to /v1/chat/completions and adapt the result."""
     body = await request.json()
     client = request.app.state.client
+    behavior = getattr(request.app.state, "behavior", None)
+    base_url = getattr(request.app.state, "base_url", "")
     previous_response_id = body.get("previous_response_id")
     previous_messages = None
     if previous_response_id:
@@ -855,7 +888,7 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
         fallback = {k: v for k, v in chat_request_body.items() if k not in ("stream", "stream_options")}
         fallback["stream"] = False
         try:
-            data, effective_nonstream_body = await _chat_with_retries(client, fallback, model)
+            data, effective_nonstream_body = await _chat_with_retries(client, fallback, model, behavior=behavior, base_url=base_url)
         except Exception as exc:
             return StreamingResponse(
                 _responses_failed_stream(
@@ -887,7 +920,7 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
             return synthetic
 
     try:
-        data, effective_chat_body = await _chat_with_retries(client, chat_body, model)
+        data, effective_chat_body = await _chat_with_retries(client, chat_body, model, behavior=behavior, base_url=base_url)
     except httpx.HTTPStatusError as exc:
         return _responses_error_response(exc)
     except Exception as exc:
@@ -907,6 +940,8 @@ async def v1_messages_handler(request: Request) -> StreamingResponse | JSONRespo
     """POST /v1/messages — Anthropic Messages compatibility layer."""
     body = await request.json()
     client = request.app.state.client
+    behavior = getattr(request.app.state, "behavior", None)
+    base_url = getattr(request.app.state, "base_url", "")
     model = body.get("model", "?")
     chat_body = anthropic_messages_to_openai_chat(body)
 
@@ -922,7 +957,7 @@ async def v1_messages_handler(request: Request) -> StreamingResponse | JSONRespo
     fallback = {k: v for k, v in chat_body.items() if k not in ("stream", "stream_options")}
     fallback["stream"] = False
     try:
-        data, _ = await _chat_with_retries(client, fallback, model)
+        data, _ = await _chat_with_retries(client, fallback, model, behavior=behavior, base_url=base_url)
     except Exception as exc:
         error_message = str(exc) or type(exc).__name__
         if body.get("stream"):

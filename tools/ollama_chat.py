@@ -1,10 +1,14 @@
 import argparse
 import atexit
+import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -13,12 +17,19 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.key_binding import KeyBindings
 
-CONTEXT_FILE = ".ollama_chat_context"
-HISTORY_FILE = ".ollama_chat_history"
-LOCK_FILE = ".ollama_chat_lock"
+# These three are rewritten by _init_session_paths() before anything else runs.
+CONTEXT_FILE = ""
+HISTORY_FILE = ""
+LOCK_FILE = ""
+CURRENT_SESSION_ID = ""
+
 ATTACHMENT_BUFFER: List[str] = []
 DEFAULT_TOOL_TIMEOUT = 120
 MAX_TOOL_OUTPUT_CHARS = 16000
+# Applied to OpenAI-compat requests (-o mode) where the proxy has no translation
+# layer to inject a sensible default.  Native /api/chat requests are handled by
+# the proxy's chat_to_openai() which already injects this value.
+DEFAULT_MAX_TOKENS = 32768
 EXTERNAL_TOOL_FILES: List[str] = []
 DEFAULT_RENDER_MODE = "markdown"
 DEFAULT_GUARDRAILS_MODE = "confirm-destructive"
@@ -30,6 +41,183 @@ try:
     _RICH_CONSOLE = Console()
 except Exception:
     _RICH_CONSOLE = None
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+_SESSIONS_DIR = Path.home() / ".ooProxy" / "sessions"
+
+
+def _cwd_hash() -> str:
+    return hashlib.sha1(os.path.abspath(os.getcwd()).encode()).hexdigest()[:8]
+
+
+def _new_session_id() -> str:
+    return f"{_cwd_hash()}-{secrets.token_hex(3)}"
+
+
+def _session_dir(session_id: str) -> Path:
+    return _SESSIONS_DIR / session_id
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_session_meta(session_id: str) -> Dict[str, Any]:
+    try:
+        return json.loads((_session_dir(session_id) / "meta.json").read_text())
+    except Exception:
+        return {}
+
+
+def _write_session_meta(session_id: str, **updates: Any) -> None:
+    path = _session_dir(session_id) / "meta.json"
+    meta = _read_session_meta(session_id)
+    meta.update(updates)
+    try:
+        path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _session_locked(session_id: str) -> bool:
+    """Return True if the session is held by a live ollama_chat process."""
+    lock = _session_dir(session_id) / "lock"
+    if not lock.exists():
+        return False
+    try:
+        pid = int(lock.read_text().strip())
+        return _pid_alive(pid) and _is_ollama_chat_process(pid)
+    except Exception:
+        return False
+
+
+def _sessions_for_cwd(cwd: str) -> List[Dict[str, Any]]:
+    """Return sessions whose meta.cwd matches *cwd*, sorted newest first."""
+    if not _SESSIONS_DIR.exists():
+        return []
+    prefix = hashlib.sha1(os.path.abspath(cwd).encode()).hexdigest()[:8]
+    results: List[Dict[str, Any]] = []
+    for d in _SESSIONS_DIR.iterdir():
+        sid = d.name
+        if not sid.startswith(prefix):
+            continue
+        meta = _read_session_meta(sid)
+        if os.path.abspath(meta.get("cwd", "")) != os.path.abspath(cwd):
+            continue
+        results.append({"id": sid, "meta": meta, "locked": _session_locked(sid)})
+    results.sort(key=lambda s: s["meta"].get("last_used", ""), reverse=True)
+    return results
+
+
+def _create_session(session_id: str, model: str) -> None:
+    _session_dir(session_id).mkdir(parents=True, exist_ok=True)
+    _write_session_meta(
+        session_id,
+        cwd=os.path.abspath(os.getcwd()),
+        model=model,
+        created_at=_now_iso(),
+        last_used=_now_iso(),
+        message_count=0,
+    )
+
+
+def _prompt_session_selection(sessions: List[Dict[str, Any]]) -> str:
+    """Print a pick-list and return the chosen session ID (or a new one)."""
+    print("\nMultiple saved sessions for this folder:")
+    for i, s in enumerate(sessions, 1):
+        meta = s["meta"]
+        ts = meta.get("last_used", "?")[:16].replace("T", " ")
+        count = meta.get("message_count", "?")
+        model = meta.get("model", "?")
+        print(f"  [{i}] {s['id']}  {model:<30}  last used: {ts}  ({count} messages)")
+    print()
+    while True:
+        try:
+            answer = input(f"Resume [1-{len(sessions)}] or N for new session: ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer == "n":
+            return ""          # caller creates new session
+        try:
+            idx = int(answer) - 1
+            if 0 <= idx < len(sessions):
+                return sessions[idx]["id"]
+        except ValueError:
+            pass
+        print(f"  Please enter a number between 1 and {len(sessions)}, or N.")
+
+
+def _migrate_legacy_context(session_id: str) -> bool:
+    """Copy .ollama_chat_context from CWD into the new session if it exists."""
+    legacy = Path(".ollama_chat_context")
+    if not legacy.exists():
+        return False
+    dest = _session_dir(session_id) / "context.json"
+    try:
+        dest.write_text(legacy.read_text())
+        legacy_hist = Path(".ollama_chat_history")
+        if legacy_hist.exists():
+            hist_dest = _session_dir(session_id) / "history"
+            hist_dest.write_text(legacy_hist.read_text())
+        print(f"📦 Migrated existing context → session {session_id}")
+        return True
+    except Exception as exc:
+        print(f"⚠️ Migration failed: {exc}")
+        return False
+
+
+def resolve_session(resume_id: Optional[str], new_session: bool, model: str) -> str:
+    """Return the session ID to use; creates a new session directory if needed."""
+    cwd = os.path.abspath(os.getcwd())
+
+    if resume_id:
+        if not _session_dir(resume_id).exists():
+            print(f"❌ Session not found: {resume_id}")
+            sys.exit(1)
+        if _session_locked(resume_id):
+            print(f"❌ Session {resume_id} is currently in use by another process.")
+            sys.exit(1)
+        return resume_id
+
+    if new_session:
+        sid = _new_session_id()
+        _create_session(sid, model)
+        return sid
+
+    sessions = _sessions_for_cwd(cwd)
+    unlocked = [s for s in sessions if not s["locked"]]
+
+    if not unlocked:
+        sid = _new_session_id()
+        _create_session(sid, model)
+        if not sessions:                 # very first session for this CWD
+            _migrate_legacy_context(sid)
+        return sid
+
+    if len(unlocked) == 1:
+        return unlocked[0]["id"]
+
+    chosen = _prompt_session_selection(unlocked)
+    if not chosen:
+        sid = _new_session_id()
+        _create_session(sid, model)
+        return sid
+    return chosen
+
+
+def _init_session_paths(session_id: str) -> None:
+    """Point the module-level path globals at the chosen session directory."""
+    global CONTEXT_FILE, HISTORY_FILE, LOCK_FILE, CURRENT_SESSION_ID
+    CURRENT_SESSION_ID = session_id
+    d = _session_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    CONTEXT_FILE = str(d / "context.json")
+    HISTORY_FILE = str(d / "history")
+    LOCK_FILE = str(d / "lock")
+
 
 # When True, we're resuming an existing conversation and should
 # avoid printing the startup banner.
@@ -829,8 +1017,10 @@ def _is_ollama_chat_process(pid: int) -> bool:
     return False
 
 
-def acquire_pidfile(lockfile: str = LOCK_FILE) -> None:
+def acquire_pidfile(lockfile: Optional[str] = None) -> None:
     """Create an exclusive pidfile. Exit if a live PID holds the lock."""
+    if lockfile is None:
+        lockfile = LOCK_FILE
     try:
         fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode())
@@ -872,7 +1062,9 @@ def acquire_pidfile(lockfile: str = LOCK_FILE) -> None:
             sys.exit(1)
 
 
-def release_pidfile(lockfile: str = LOCK_FILE) -> None:
+def release_pidfile(lockfile: Optional[str] = None) -> None:
+    if lockfile is None:
+        lockfile = LOCK_FILE
     try:
         if os.path.exists(lockfile):
             try:
@@ -921,9 +1113,13 @@ def save_context(messages: List[Dict]) -> int:
         if not messages:
             if os.path.exists(CONTEXT_FILE):
                 os.remove(CONTEXT_FILE)
+            if CURRENT_SESSION_ID:
+                _write_session_meta(CURRENT_SESSION_ID, last_used=_now_iso(), message_count=0)
             return -1 # Indicates file was removed
         with open(CONTEXT_FILE, "w", encoding="utf-8") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
+        if CURRENT_SESSION_ID:
+            _write_session_meta(CURRENT_SESSION_ID, last_used=_now_iso(), message_count=len(messages))
         return len(messages)
     except Exception as e:
         print(f"⚠️ Could not save context: {e}")
@@ -988,7 +1184,8 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
                 {"role": "system", "content": summary_prompt},
                 {"role": "user", "content": f"Conversation:\n\n{history_text}\n\nProvide compact summary:"}
             ],
-            "stream": True
+            "stream": True,
+            "max_tokens": DEFAULT_MAX_TOKENS,
         }
     else:
         url = f"{base_url}/api/chat"
@@ -998,11 +1195,12 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
                 {"role": "system", "content": summary_prompt},
                 {"role": "user", "content": f"Conversation:\n\n{history_text}\n\nProvide compact summary:"}
             ],
-            "stream": True
+            "stream": True,
         }
 
     try:
         response = requests.post(url, json=payload, stream=True, timeout=180)
+        response.raise_for_status()
         full_summary = ""
         print("Summary: ", end="", flush=True)
         for line in response.iter_lines():
@@ -1034,6 +1232,12 @@ def compact_context(model: str, messages: List[Dict], base_url: str, use_openai:
     except Exception as e:
         print(f"❌ Compact failed: {e}")
         return messages
+
+def _print_resume_hint() -> None:
+    if CURRENT_SESSION_ID:
+        script = os.path.basename(__file__)
+        print(f"💡 To resume: python {script} <model> -r {CURRENT_SESSION_ID}")
+
 
 def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: bool, render_mode: str, guardrails_mode: str):
     global ATTACHMENT_BUFFER
@@ -1073,7 +1277,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
 
     # Only show startup banner/help when NOT resuming an existing session
     if not CONTINUE_SESSION:
-        print(f"🤖 Chat with **{model}** started")
+        print(f"🤖 Chat with **{model}** started  [session: {CURRENT_SESSION_ID}]")
         print("Available commands:")
         print(" /exit, /quit, /bye → Save and exit")
         print(" /reset → Clear all context")
@@ -1082,6 +1286,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
         print(" /file <filename> → Add file to next message")
         print(" /clearfiles → Clear attachment buffer")
         print(" /tools → List available local tools")
+        print(" /sessions → List saved sessions for this folder")
         print(" /status → View session information")
         print(f" Render mode: {render_mode}")
         print(f" Guardrails: {guardrails_mode}")
@@ -1102,7 +1307,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
             known_cmds = {
                 '/exit', '/quit', '/bye',
                 '/reset', '/compact', '/model',
-                '/file', '/clearfiles', '/status', '/tools', '/?', '/help',
+                '/file', '/clearfiles', '/status', '/sessions', '/tools', '/?', '/help',
                 '/redraw'
             }
             if cmd.startswith('/') and cmd not in known_cmds:
@@ -1116,6 +1321,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                     print("🗑️ Context file removed (no messages to save). Goodbye!")
                 elif saved_count > 0:
                     print(f"💾 Context saved ({saved_count} messages). Goodbye!")
+                    _print_resume_hint()
                 else:
                     print("⚠️ Context could not be saved. Goodbye!")
                 break
@@ -1157,6 +1363,8 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 # If argument provided, switch model
                 new_model = parts[1].strip()
                 model = new_model
+                if CURRENT_SESSION_ID:
+                    _write_session_meta(CURRENT_SESSION_ID, model=model)
                 print(f"🔄 Model switched to: {model}")
                 continue
 
@@ -1194,6 +1402,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 print(" /file <filename> → Add file to next message")
                 print(" /clearfiles → Clear attachment buffer")
                 print(" /tools → List available local tools")
+                print(" /sessions → List saved sessions for this folder")
                 print(" /status → View session information")
                 print(" /? or /help → Show this help text")
                 print(" Enter → submit | Alt-Enter / Shift-Enter / Ctrl-J → new line\n")
@@ -1215,12 +1424,31 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 messages = load_context()
                 continue
 
+            elif cmd == '/sessions':
+                all_sessions = _sessions_for_cwd(os.getcwd())
+                if not all_sessions:
+                    print("No saved sessions for this folder.")
+                else:
+                    print(f"\nSaved sessions for this folder ({len(all_sessions)}):")
+                    for s in all_sessions:
+                        meta = s["meta"]
+                        ts = meta.get("last_used", "?")[:16].replace("T", " ")
+                        count = meta.get("message_count", "?")
+                        m = meta.get("model", "?")
+                        active = " ← current" if s["id"] == CURRENT_SESSION_ID else ""
+                        locked = " [in use]" if s["locked"] and s["id"] != CURRENT_SESSION_ID else ""
+                        print(f"  {s['id']}  {m:<30}  {ts}  ({count} msgs){active}{locked}")
+                    print(f"\nResume with: ollama_chat <model> -r <session-id>")
+                print()
+                continue
+
             elif cmd == '/status':
                 print("\n--- 📊 Session Status ---")
+                print(f"🆔 Session ID: {CURRENT_SESSION_ID}")
                 print(f"🤖 Active Model: {model}")
                 print(f"🌐 API Endpoint: {base_url}")
                 print(f"🔌 API Mode: {'OpenAI Compatible' if use_openai else 'Native Ollama'}")
-                print(f"📂 Context File: {CONTEXT_FILE}")
+                print(f"📂 Session Dir: {_session_dir(CURRENT_SESSION_ID)}")
 
                 # Calculate context size
                 ctx_len = len(messages)
@@ -1259,6 +1487,10 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                     "messages": messages,
                     "stream": True,
                 }
+                if use_openai:
+                    # Proxy passthrough doesn't inject max_tokens; set it here
+                    # to avoid NIM's tiny default (32 tokens).
+                    payload["max_tokens"] = DEFAULT_MAX_TOKENS
                 if request_uses_tools:
                     payload["tools"] = TOOL_SCHEMAS
                     if use_openai:
@@ -1299,6 +1531,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
 
         except requests.exceptions.ConnectionError:
             print(f"\n❌ Could not connect to server at {base_url}. Is it running?")
+            _print_resume_hint()
             break
         except KeyboardInterrupt:
             saved_count = save_context(messages)
@@ -1306,6 +1539,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 print("\n\n👋 Chat ended. Context file removed (no messages to save).")
             elif saved_count > 0:
                 print(f"\n\n👋 Chat ended. Context saved ({saved_count} messages).")
+                _print_resume_hint()
             else:
                 print("\n\n👋 Chat ended. Context could not be saved.")
             break
@@ -1318,7 +1552,12 @@ def main():
     parser.add_argument("-o", "--openai", action="store_true", help="Use OpenAI compatible API endpoint")
     parser.add_argument("-H", "--host", default="localhost", help="Hostname or IP address of the Ollama server (default: localhost)")
     parser.add_argument("-P", "--port", default="11434", help="Port of the Ollama server (default: 11434)")
-    parser.add_argument("-c", "--clean", action="store_true", help="Start with empty context (overwrites old context on exit)")
+    parser.add_argument("-r", "--resume", metavar="SESSION_ID", default=None,
+                        help="Resume a specific session by ID (see /sessions inside chat)")
+    parser.add_argument("--new", action="store_true",
+                        help="Always start a new session, ignoring any existing saved sessions")
+    parser.add_argument("-c", "--clean", action="store_true",
+                        help="Start a new session with an empty context (alias for --new)")
     parser.add_argument("-t", "--tools", action="append", default=[], help="Path to a JSON file defining additional command-backed tools. Can be passed multiple times.")
     parser.add_argument("--no-tools", action="store_true", help="Disable local tool definitions for this session")
     parser.add_argument("--render-mode", choices=["markdown", "stream"], default=DEFAULT_RENDER_MODE, help="How assistant replies are shown: buffered markdown view or live raw stream.")
@@ -1330,11 +1569,10 @@ def main():
     # Construct base URL
     base_url = f"http://{args.host}:{args.port}"
 
-    # Acquire pidfile to prevent concurrent sessions in same folder
-    acquire_pidfile()
-
-    # Ensure pidfile is removed on exit
-    atexit.register(release_pidfile)
+    # Resolve which session to use and point the path globals at it.
+    new_session = args.new or args.clean
+    session_id = resolve_session(args.resume, new_session, args.model)
+    _init_session_paths(session_id)
 
     # Make signals trigger clean exit so atexit handlers run
     def _handle_signal(signum, frame):
@@ -1344,28 +1582,11 @@ def main():
         try:
             signal.signal(_sig, _handle_signal)
         except Exception:
-            # some signals may not be available on all platforms
             pass
 
-    # If requested, start with a clean context (delete existing context file).
-    if getattr(args, "clean", False):
-        try:
-            if os.path.exists(CONTEXT_FILE):
-                os.remove(CONTEXT_FILE)
-                print(f"🧹 Starting with a clean context (removed {CONTEXT_FILE}).")
-            else:
-                print("🧹 Starting with a clean context (no existing context file).")
-        except Exception as e:
-            print(f"⚠️ Could not remove context file: {e}")
-        # Also remove history file when clean flag is used
-        try:
-            if os.path.exists(HISTORY_FILE):
-                os.remove(HISTORY_FILE)
-                print(f"🧹 Removed history file: {HISTORY_FILE}")
-            else:
-                print("🧹 No history file to remove.")
-        except Exception as e:
-            print(f"⚠️ Could not remove history file: {e}")
+    # Acquire per-session pidfile to prevent two processes on the same session.
+    acquire_pidfile()
+    atexit.register(release_pidfile)
 
     chat_with_ollama(
         args.model,

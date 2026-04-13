@@ -7,6 +7,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from modules._server.app import create_app
+from modules._server.behavior import BehaviorCache
 from modules._server.config import ProxyConfig
 
 
@@ -130,6 +131,7 @@ class V1ResponsesCompatibilityTests(unittest.TestCase):
         self.client.__enter__()
         self.dummy = _DummyClient()
         self.app.state.client = self.dummy
+        self.app.state.behavior = BehaviorCache(path=None)  # in-memory only — no disk state between tests
 
     def tearDown(self) -> None:
         self.client.__exit__(None, None, None)
