@@ -1328,6 +1328,78 @@ def save_context(messages: List[Dict]) -> int:
         print(f"⚠️ Could not save context: {e}")
         return 0
 
+
+def _session_export_markdown(messages: List[Dict[str, Any]], active_model: str = "") -> str:
+    meta = _read_session_meta(CURRENT_SESSION_ID) if CURRENT_SESSION_ID else {}
+    model = active_model or str(meta.get("model", "")).strip() or "unknown"
+    host = str(meta.get("host", DEFAULT_HOST)).strip() or DEFAULT_HOST
+    port = str(meta.get("port", DEFAULT_PORT)).strip() or DEFAULT_PORT
+
+    lines = [
+        "# ooProxy Session Export",
+        "",
+        f"- Exported at: {_now_iso()}",
+        f"- Session ID: {CURRENT_SESSION_ID or 'unsaved'}",
+        f"- Model: {model}",
+        f"- Endpoint: http://{host}:{port}",
+        f"- Message count: {len(messages)}",
+        "",
+    ]
+
+    if not messages:
+        lines.extend([
+            "_No messages in this session._",
+            "",
+        ])
+        return "\n".join(lines)
+
+    for index, message in enumerate(messages, 1):
+        role = message.get("role", "assistant")
+        heading = role.capitalize()
+        if role == "tool":
+            tool_name = message.get("tool_name") or message.get("name") or "tool"
+            heading = f"Tool `{tool_name}`"
+
+        lines.extend([
+            f"## {index}. {heading}",
+            "",
+        ])
+
+        content = message.get("content") or ""
+        if content:
+            lines.extend([
+                content,
+                "",
+            ])
+        else:
+            lines.extend([
+                "_No text content._",
+                "",
+            ])
+
+        if role == "assistant":
+            tool_summaries = _message_tool_summaries(message)
+            if tool_summaries:
+                lines.append("### Tool Calls")
+                lines.append("")
+                for summary in tool_summaries:
+                    lines.append(f"- `{summary}`")
+                lines.append("")
+
+    return "\n".join(lines)
+
+
+def export_session_markdown(path: str, messages: List[Dict[str, Any]], active_model: str = "") -> str:
+    target = os.path.abspath(path)
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    markdown = _session_export_markdown(messages, active_model=active_model)
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(markdown)
+    return target
+
 def read_file_content(filepath: str) -> str:
     """Read file and return content with filename header."""
     try:
@@ -1459,6 +1531,7 @@ def _command_help_markdown(render_mode: str | None = None, guardrails_mode: str 
         "| Command | Action |",
         "| --- | --- |",
         "| /exit, /quit, /bye | Save and exit |",
+        "| /export <file> | Export the whole session as raw Markdown |",
         "| /reset | Clear all context |",
         "| /compact | Summarize and shorten history |",
         "| /model [name] | Switch model; with no name, list available models |",
@@ -1556,7 +1629,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
             # treat it as a typo and do not forward to the model.
             known_cmds = {
                 '/exit', '/quit', '/bye',
-                '/reset', '/compact', '/model',
+                '/export', '/reset', '/compact', '/model',
                 '/file', '/clearfiles', '/status', '/sessions', '/tools', '/?', '/help',
                 '/redraw'
             }
@@ -1575,6 +1648,19 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 else:
                     print("⚠️ Context could not be saved. Goodbye!")
                 break
+
+            elif cmd == '/export':
+                if len(parts) < 2 or not parts[1].strip():
+                    print("Usage: /export <filename>")
+                    continue
+
+                export_path = parts[1].strip()
+                try:
+                    written_path = export_session_markdown(export_path, messages, active_model=model)
+                    print(f"💾 Session exported to: {written_path}")
+                except Exception as exc:
+                    print(f"❌ Export failed: {exc}")
+                continue
 
             elif cmd == '/reset':
                 messages = []
