@@ -10,6 +10,18 @@ from modules._server.endpoint_profiles import resolve_endpoint_profile
 
 
 class EndpointProfileResolutionTests(unittest.TestCase):
+    def test_resolves_openrouter_profile_from_api_base(self) -> None:
+        profile = resolve_endpoint_profile("https://openrouter.ai/api/v1")
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.id, "openrouter")
+        self.assertEqual(profile.models_path, "models")
+        self.assertEqual(profile.models_format, "openai")
+        self.assertEqual(profile.chat_path, "chat/completions")
+        self.assertEqual(profile.chat_streaming, "sse")
+        self.assertEqual(profile.chat_tools, "supported")
+        self.assertEqual(profile.chat_system_prompt, "supported")
+
     def test_resolves_together_profile_from_host(self) -> None:
         profile = resolve_endpoint_profile("https://api.together.xyz/v1")
 
