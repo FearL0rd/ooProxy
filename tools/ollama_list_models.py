@@ -16,7 +16,7 @@ def list_ollama_models(base_url: str, use_openai: bool) -> List[Dict]:
             models = [{"name": item.get("id", "Unknown")} for item in data.get("data", [])]
         else:
             models = data.get("models", [])
-        return models
+        return sorted(models, key=lambda model: str(model.get("name", "")).casefold())
     except requests.exceptions.ConnectionError:
         print(f"❌ Could not connect to server at {base_url}. Is it running?")
         return []

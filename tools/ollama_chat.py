@@ -1350,13 +1350,13 @@ def get_available_models(base_url: str) -> List[str]:
         response = requests.get(f"{base_url}/api/tags", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            return [m['name'] for m in data.get('models', [])]
+            return sorted((m['name'] for m in data.get('models', [])), key=str.casefold)
         
         # Fallback for OpenAI compatible endpoints (often at /v1/models)
         response = requests.get(f"{base_url}/v1/models", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            return [m['id'] for m in data.get('data', [])]
+            return sorted((m['id'] for m in data.get('data', [])), key=str.casefold)
             
     except Exception as e:
         print(f"⚠️ Could not fetch models: {e}")
