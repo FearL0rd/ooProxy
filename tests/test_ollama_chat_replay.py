@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from unittest.mock import call
 from unittest.mock import patch
 
 from rich.console import Console
@@ -131,6 +132,58 @@ class OllamaChatReplayTests(unittest.TestCase):
         self.assertEqual(output_lines[0].strip(), "Name   Source   Mode       Description")
         self.assertEqual(output_lines[-1].strip(), "alpha  builtin  read-only  Alpha tool")
         self.assertTrue(all(line.strip() for line in output_lines))
+
+    def test_split_thinking_sections_extracts_tagged_reasoning(self) -> None:
+        parts = ollama_chat._split_thinking_sections(
+            "Visible answer<think>step 1\nstep 2</think>Final line"
+        )
+
+        self.assertEqual(
+            parts,
+            [
+                (False, "Visible answer"),
+                (True, "step 1\nstep 2"),
+                (False, "Final line"),
+            ],
+        )
+
+    def test_render_message_text_routes_thinking_blocks_separately(self) -> None:
+        with patch("tools.ollama_chat.render_markdown_to_terminal") as render_markdown, \
+             patch("tools.ollama_chat.render_thinking_to_terminal") as render_thinking, \
+             patch("sys.stdout", new_callable=StringIO):
+            ollama_chat._render_message_text(
+                "Visible answer\n<think>step 1\nstep 2</think>\nFinal line"
+            )
+
+        self.assertEqual(
+            render_markdown.call_args_list,
+            [call("Visible answer\n"), call("\nFinal line")],
+        )
+        render_thinking.assert_called_once_with("step 1\nstep 2")
+
+    def test_stream_renderer_hides_think_tags_and_styles_thinking_content(self) -> None:
+        renderer = ollama_chat._ThinkingStreamRenderer(console=None)
+
+        with patch("tools.ollama_chat._write_stream_text", side_effect=lambda text, **kwargs: bool(text)) as write_stream_text:
+            wrote = renderer.feed("Hello<thi")
+            wrote = renderer.feed("nk>plan") or wrote
+            wrote = renderer.feed("ning</think> world") or wrote
+            wrote = renderer.finalize() or wrote
+
+        self.assertTrue(wrote)
+        rendered_parts = [
+            (entry.args[0], entry.kwargs["thinking"])
+            for entry in write_stream_text.call_args_list
+        ]
+        self.assertEqual(
+            rendered_parts,
+            [
+                ("Hello", False),
+                ("plan", True),
+                ("ning", True),
+                (" world", False),
+            ],
+        )
 
     def test_turn_separator_uses_horizontal_rule_renderer(self) -> None:
         with patch("tools.ollama_chat.render_horizontal_rule") as render_rule:

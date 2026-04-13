@@ -40,15 +40,24 @@ TOOL_LOAD_SUMMARY_SHOWN = False
 TURN_SEPARATOR_CHAR = "─"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = "11434"
+THINK_TAG_OPEN = "<think>"
+THINK_TAG_CLOSE = "</think>"
+THINKING_PANEL_TITLE = "Thinking"
+THINKING_STYLE = "cyan"
+THINKING_STATUS_TEXT = "Thinking..."
 
 # Optional rich-based Markdown renderer for prettier terminal output
 try:
     from rich.console import Console
     from rich.markdown import Markdown
+    from rich.panel import Panel
     from rich.rule import Rule
+    from rich.text import Text
     _RICH_CONSOLE = Console()
 except Exception:
+    Panel = None
     Rule = None
+    Text = None
     _RICH_CONSOLE = None
 
 # ---------------------------------------------------------------------------
@@ -287,6 +296,189 @@ def render_markdown_to_terminal(text: str, console: Any = None) -> None:
             pass
     # Fallback
     print(text)
+
+
+def _supports_terminal_styles(stream: Any) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+def _split_trailing_partial_token(text: str, token: str) -> Tuple[str, str]:
+    max_partial = min(len(text), len(token) - 1)
+    for size in range(max_partial, 0, -1):
+        if text.endswith(token[:size]):
+            return text[:-size], text[-size:]
+    return text, ""
+
+
+def _append_thinking_segment(segments: List[Tuple[bool, str]], is_thinking: bool, text: str) -> None:
+    if not text:
+        return
+    if segments and segments[-1][0] == is_thinking:
+        previous_flag, previous_text = segments[-1]
+        segments[-1] = (previous_flag, previous_text + text)
+        return
+    segments.append((is_thinking, text))
+
+
+def _split_thinking_sections(text: str) -> List[Tuple[bool, str]]:
+    segments: List[Tuple[bool, str]] = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find(THINK_TAG_OPEN, cursor)
+        if start == -1:
+            _append_thinking_segment(segments, False, text[cursor:])
+            break
+
+        _append_thinking_segment(segments, False, text[cursor:start])
+        cursor = start + len(THINK_TAG_OPEN)
+
+        end = text.find(THINK_TAG_CLOSE, cursor)
+        if end == -1:
+            _append_thinking_segment(segments, True, text[cursor:])
+            break
+
+        _append_thinking_segment(segments, True, text[cursor:end])
+        cursor = end + len(THINK_TAG_CLOSE)
+
+    return segments
+
+
+def render_thinking_to_terminal(text: str, console: Any = None) -> None:
+    body = text.strip("\n")
+    if not body:
+        return
+
+    if console is None:
+        console = _RICH_CONSOLE
+    if console and Panel is not None and Text is not None:
+        try:
+            console.print(
+                Panel(
+                    Text(body, style=THINKING_STYLE),
+                    title=THINKING_PANEL_TITLE,
+                    border_style=THINKING_STYLE,
+                )
+            )
+            return
+        except Exception:
+            pass
+
+    stream = sys.stdout
+    if _supports_terminal_styles(stream):
+        stream.write(f"\033[36m{THINKING_PANEL_TITLE}:\033[0m\n\033[36m{body}\033[0m\n")
+        flush = getattr(stream, "flush", None)
+        if callable(flush):
+            flush()
+        return
+
+    print(f"{THINKING_PANEL_TITLE}:\n{body}")
+
+
+def _write_stream_text(text: str, *, thinking: bool = False, console: Any = None) -> bool:
+    if not text:
+        return False
+
+    if console is None:
+        console = _RICH_CONSOLE
+    if console:
+        try:
+            console.print(
+                text,
+                end="",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+                style=THINKING_STYLE if thinking else None,
+            )
+            return True
+        except Exception:
+            pass
+
+    stream = sys.stdout
+    if thinking and _supports_terminal_styles(stream):
+        stream.write(f"\033[36m{text}\033[0m")
+    else:
+        stream.write(text)
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        flush()
+    return True
+
+
+def _show_thinking_status(console: Any = None) -> bool:
+    if console is None:
+        console = _RICH_CONSOLE
+    stream = getattr(console, "file", None) if console is not None else sys.stdout
+    if stream is None or not _supports_terminal_styles(stream):
+        return False
+
+    if console:
+        try:
+            console.print(THINKING_STATUS_TEXT, style=f"dim {THINKING_STYLE}", end="", markup=False, highlight=False)
+            return True
+        except Exception:
+            pass
+
+    stream.write(THINKING_STATUS_TEXT)
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        flush()
+    return True
+
+
+def _clear_thinking_status(shown: bool, console: Any = None) -> None:
+    if not shown:
+        return
+
+    if console is None:
+        console = _RICH_CONSOLE
+    stream = getattr(console, "file", None) if console is not None else sys.stdout
+    if stream is None or not _supports_terminal_styles(stream):
+        return
+
+    stream.write("\r\033[2K\r")
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        flush()
+
+
+class _ThinkingStreamRenderer:
+    def __init__(self, console: Any = None) -> None:
+        self.console = console
+        self.pending = ""
+        self.in_thinking = False
+
+    def _emit(self, text: str) -> bool:
+        return _write_stream_text(text, thinking=self.in_thinking, console=self.console)
+
+    def feed(self, chunk: str) -> bool:
+        self.pending += chunk
+        wrote = False
+
+        while self.pending:
+            token = THINK_TAG_CLOSE if self.in_thinking else THINK_TAG_OPEN
+            marker_index = self.pending.find(token)
+            if marker_index == -1:
+                emit, suffix = _split_trailing_partial_token(self.pending, token)
+                if emit:
+                    wrote = self._emit(emit) or wrote
+                self.pending = suffix
+                break
+
+            if marker_index:
+                wrote = self._emit(self.pending[:marker_index]) or wrote
+            self.pending = self.pending[marker_index + len(token):]
+            self.in_thinking = not self.in_thinking
+
+        return wrote
+
+    def finalize(self) -> bool:
+        if not self.pending:
+            return False
+        pending = self.pending
+        self.pending = ""
+        return self._emit(pending)
 
 
 def render_horizontal_rule(character: str = TURN_SEPARATOR_CHAR, console: Any = None) -> None:
@@ -845,7 +1037,22 @@ def _render_message_text(text: str) -> None:
     if not text:
         return
     try:
-        render_markdown_to_terminal(text)
+        segments = _split_thinking_sections(text)
+        if not any(is_thinking for is_thinking, _ in segments):
+            render_markdown_to_terminal(text)
+            return
+
+        printed_anything = False
+        for is_thinking, segment in segments:
+            if not segment.strip("\n"):
+                continue
+            if printed_anything:
+                print()
+            if is_thinking:
+                render_thinking_to_terminal(segment)
+            else:
+                render_markdown_to_terminal(segment)
+            printed_anything = True
     except Exception:
         print(text)
 
@@ -1112,6 +1319,14 @@ def _stream_chat_response(
     openai_tool_buffers: Dict[int, Dict[str, Any]] = {}
     ollama_tool_buffers: Dict[int, Dict[str, Any]] = {}
     printed_content = False
+    thinking_status_shown = _show_thinking_status()
+    stream_renderer = _ThinkingStreamRenderer(console=_RICH_CONSOLE) if render_mode == "stream" else None
+
+    def _mark_response_started() -> None:
+        nonlocal thinking_status_shown
+        if thinking_status_shown:
+            _clear_thinking_status(thinking_status_shown)
+            thinking_status_shown = False
 
     try:
         for line in response.iter_lines():
@@ -1132,11 +1347,14 @@ def _stream_chat_response(
                     message = chunk.get("message") or {}
                     content = message.get("content") or ""
                     if content:
+                        _mark_response_started()
                         if render_mode == "stream":
-                            print(content, end="", flush=True)
-                            printed_content = True
+                            printed_content = stream_renderer.feed(content) or printed_content
                         content_parts.append(content)
-                    _update_ollama_tool_buffers(ollama_tool_buffers, message.get("tool_calls") or [])
+                    tool_calls = message.get("tool_calls") or []
+                    if tool_calls:
+                        _mark_response_started()
+                    _update_ollama_tool_buffers(ollama_tool_buffers, tool_calls)
                     continue
 
                 choices = chunk.get("choices") or []
@@ -1145,11 +1363,14 @@ def _stream_chat_response(
                 delta = choices[0].get("delta") or {}
                 content = delta.get("content") or ""
                 if content:
+                    _mark_response_started()
                     if render_mode == "stream":
-                        print(content, end="", flush=True)
-                        printed_content = True
+                        printed_content = stream_renderer.feed(content) or printed_content
                     content_parts.append(content)
-                _update_openai_tool_buffers(openai_tool_buffers, delta.get("tool_calls") or [])
+                tool_calls = delta.get("tool_calls") or []
+                if tool_calls:
+                    _mark_response_started()
+                _update_openai_tool_buffers(openai_tool_buffers, tool_calls)
                 continue
 
             try:
@@ -1160,13 +1381,20 @@ def _stream_chat_response(
             message = chunk.get("message") or {}
             content = message.get("content") or ""
             if content:
+                _mark_response_started()
                 if render_mode == "stream":
-                    print(content, end="", flush=True)
-                    printed_content = True
+                    printed_content = stream_renderer.feed(content) or printed_content
                 content_parts.append(content)
-            _update_ollama_tool_buffers(ollama_tool_buffers, message.get("tool_calls") or [])
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                _mark_response_started()
+            _update_ollama_tool_buffers(ollama_tool_buffers, tool_calls)
     finally:
         response.close()
+        _clear_thinking_status(thinking_status_shown)
+
+    if stream_renderer is not None:
+        printed_content = stream_renderer.finalize() or printed_content
 
     if printed_content:
         print()
