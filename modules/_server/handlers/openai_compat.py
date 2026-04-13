@@ -30,6 +30,9 @@ from modules._server.upstream_errors import (
 )
 from modules._server.translate.request import responses_to_openai_chat
 from modules._server.translate.request import anthropic_messages_to_openai_chat
+from modules._server.translate.request import anthropic_direct_display_tool_reply
+from modules._server.translate.request import direct_display_tool_reply
+from modules._server.translate.request import sanitize_openai_chat_body
 from modules._server.translate.response import openai_chat_to_anthropic_message, openai_chat_to_responses
 
 
@@ -779,13 +782,18 @@ def _upstream_error_response(exc: Exception, model: str, streaming: bool):
 
 async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     """POST /v1/chat/completions — OpenAI-format pass-through."""
-    body = await request.json()
+    raw_body = await request.json()
+    direct_reply = direct_display_tool_reply(raw_body)
+    body = sanitize_openai_chat_body(raw_body)
     client = request.app.state.client
     behavior = getattr(request.app.state, "behavior", None)
     base_url = getattr(request.app.state, "base_url", "")
     endpoint_profile = getattr(request.app.state, "endpoint_profile", None)
     streaming = body.get("stream", False)
     model = body.get("model", "?")
+
+    if direct_reply is not None:
+        return _synthetic_stream(model, direct_reply) if streaming else _synthetic_json(model, direct_reply)
 
     logger.info("v1/chat model=%s stream=%s msgs=%d tools=%s",
                 model, streaming, len(body.get("messages", [])),
@@ -949,6 +957,19 @@ async def v1_responses_handler(request: Request) -> StreamingResponse | JSONResp
     chat_body, input_messages = responses_to_openai_chat(body, previous_messages=previous_messages)
     model = body.get("model", "?")
     response_id = f"resp_{uuid.uuid4().hex}"
+    direct_reply = direct_display_tool_reply({"messages": input_messages, "tools": body.get("tools")})
+
+    if direct_reply is not None:
+        response_payload = synthetic_responses_payload(
+            body,
+            response_id,
+            direct_reply,
+            previous_response_id=previous_response_id,
+        )
+        _remember_response(request, response_id, [*input_messages, {"role": "assistant", "content": direct_reply}])
+        if body.get("stream"):
+            return StreamingResponse(_responses_synthetic_stream(response_payload), media_type="text/event-stream")
+        return JSONResponse(response_payload)
 
     logger.info("v1/responses model=%s stream=%s prev=%s input_items=%s",
                 model, bool(body.get("stream")), previous_response_id or "-",
@@ -1031,7 +1052,14 @@ async def v1_messages_handler(request: Request) -> StreamingResponse | JSONRespo
     base_url = getattr(request.app.state, "base_url", "")
     endpoint_profile = getattr(request.app.state, "endpoint_profile", None)
     model = body.get("model", "?")
+    direct_reply = anthropic_direct_display_tool_reply(body)
     chat_body = anthropic_messages_to_openai_chat(body)
+
+    if direct_reply is not None:
+        anthropic_message = synthetic_anthropic_message(body, direct_reply)
+        if body.get("stream"):
+            return StreamingResponse(_anthropic_synthetic_stream(anthropic_message), media_type="text/event-stream")
+        return JSONResponse(anthropic_message)
 
     if _should_disable_anthropic_tools(body):
         if "tools" in chat_body or "tool_choice" in chat_body:

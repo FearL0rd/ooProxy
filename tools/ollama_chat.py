@@ -808,7 +808,7 @@ def _tool_command_handler_factory(name: str, command_spec: Dict[str, Any]) -> To
 def _normalize_external_tool_definition(raw_tool: Dict[str, Any], tool_file: str) -> Dict[str, Any]:
     if raw_tool.get("type") == "function":
         function = dict(raw_tool.get("function") or {})
-        for key in ("description", "parameters", "read_only", "destructive", "command", "argv", "cwd", "timeout"):
+        for key in ("description", "parameters", "read_only", "destructive", "display_directly", "command", "argv", "cwd", "timeout"):
             if key in raw_tool and key not in function:
                 function[key] = raw_tool[key]
     else:
@@ -848,6 +848,7 @@ def _normalize_external_tool_definition(raw_tool: Dict[str, Any], tool_file: str
         "source": tool_file,
         "read_only": bool(function.get("read_only", False)),
         "destructive": bool(function.get("destructive", False)),
+        "display_directly": bool(function.get("display_directly", False)),
         "shell_command": bool(command),
         "handler": _tool_command_handler_factory(name, {
             "command": command,
@@ -1002,6 +1003,26 @@ def _tool_denied_message(reason: str) -> str:
     })
 
 
+def _tool_result_failed(result: str) -> bool:
+    if not result:
+        return False
+    try:
+        payload = json.loads(result)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("return_code"), int):
+        return payload["return_code"] != 0
+    if payload.get("ok") is False:
+        return True
+    return bool(payload.get("error")) and payload.get("ok") is not True
+
+
+def _tool_return_code_result(ok: bool) -> str:
+    return json.dumps({"return_code": 0 if ok else 1}, ensure_ascii=False)
+
+
 def _command_looks_destructive(command: str) -> bool:
     lower = f" {command.lower()} "
     destructive_tokens = [
@@ -1089,7 +1110,7 @@ def _tool_support_error(message: str) -> bool:
 
 def _message_display_text(message: Dict[str, Any]) -> str:
     role = message.get("role", "assistant")
-    content = message.get("content") or ""
+    content = _message_visible_content(message)
     if role == "tool":
         name = message.get("tool_name") or message.get("name") or message.get("tool_call_id") or "tool"
         return f"{name}\n{content}" if content else name
@@ -1130,8 +1151,90 @@ def _message_tool_summaries(message: Dict[str, Any]) -> List[str]:
 def _should_display_replayed_message(message: Dict[str, Any]) -> bool:
     role = message.get("role", "assistant")
     if role == "tool":
-        return False
+        return bool(message.get("display_directly") and _message_visible_content(message))
     return True
+
+
+def _message_visible_content(message: Dict[str, Any]) -> str:
+    if message.get("role") == "tool" and message.get("display_directly"):
+        display_content = message.get("display_content")
+        if isinstance(display_content, str):
+            return display_content
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def _message_for_model(message: Dict[str, Any], *, include_direct_display_content: bool) -> Dict[str, Any]:
+    sanitized = dict(message)
+    if sanitized.get("role") == "tool" and sanitized.get("display_directly"):
+        if include_direct_display_content:
+            sanitized["content"] = _message_visible_content(sanitized)
+    sanitized.pop("display_content", None)
+    sanitized.pop("display_directly", None)
+    sanitized.pop("tool_failed", None)
+    return sanitized
+
+
+def _messages_for_model(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized_messages: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        include_direct_display_content = False
+        if message.get("role") == "tool" and message.get("display_directly"):
+            include_direct_display_content = any(
+                isinstance(later_message, dict) and later_message.get("role") != "tool"
+                for later_message in messages[index + 1:]
+            )
+        sanitized_messages.append(
+            _message_for_model(
+                message,
+                include_direct_display_content=include_direct_display_content,
+            )
+        )
+    return sanitized_messages
+
+
+def _render_tool_output_direct(text: str) -> bool:
+    if not text:
+        return False
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+    return True
+
+
+def _sanitize_assistant_tool_preamble(message: Dict[str, Any]) -> Dict[str, Any]:
+    tool_calls = message.get("tool_calls") or []
+    content = message.get("content") or ""
+    if not tool_calls or not isinstance(content, str):
+        return message
+
+    stripped = content.strip()
+    if not stripped:
+        return message
+
+    if stripped[-1:] in ".!?)]}`\"'":
+        return message
+
+    lowered = stripped.lower()
+    preamble_starts = (
+        "i'll ",
+        "i will ",
+        "let me ",
+        "i'm going to ",
+        "im going to ",
+        "i need to ",
+        "first, i'll ",
+        "first i will ",
+        "next, i'll ",
+        "next i will ",
+    )
+    if lowered.startswith(preamble_starts):
+        sanitized = dict(message)
+        sanitized["content"] = ""
+        return sanitized
+
+    return message
 
 
 def _render_message_text(text: str) -> None:
@@ -1180,12 +1283,15 @@ def _print_question_line(text: str) -> None:
 
 
 def _print_assistant_message_body(message: Dict[str, Any], *, content_already_rendered: bool = False) -> bool:
-    content = message.get("content") or ""
+    content = _message_visible_content(message)
     tool_summaries = _message_tool_summaries(message)
     printed_anything = False
 
     if content and not content_already_rendered:
-        _render_message_text(content)
+        if message.get("role") == "tool" and message.get("display_directly"):
+            _render_tool_output_direct(content)
+        else:
+            _render_message_text(content)
         printed_anything = True
 
     if tool_summaries:
@@ -1224,6 +1330,10 @@ def _replay_conversation(messages: List[Dict[str, Any]]) -> None:
     for message in messages:
         role = message.get("role", "assistant")
         if role == "tool":
+            if _should_display_replayed_message(message):
+                if pending_question is None:
+                    pending_question = ""
+                answer_messages.append(message)
             continue
         if role == "user":
             flush_event()
@@ -1289,19 +1399,45 @@ def _assistant_message_from_response(data: Dict[str, Any], use_openai: bool) -> 
 
 
 def _tool_result_message(name: str, result: str, call_id: str, use_openai: bool) -> Dict[str, Any]:
+    return _tool_result_message_with_mode(
+        name,
+        result,
+        call_id,
+        use_openai,
+        display_directly=False,
+        ok=True,
+    )
+
+
+def _tool_result_message_with_mode(
+    name: str,
+    result: str,
+    call_id: str,
+    use_openai: bool,
+    *,
+    display_directly: bool,
+    ok: bool,
+) -> Dict[str, Any]:
+    content = _tool_return_code_result(ok) if display_directly else result
     if use_openai:
-        return {
+        message = {
             "role": "tool",
             "tool_name": name,
             "name": name,
             "tool_call_id": call_id,
-            "content": result,
+            "content": content,
         }
-    return {
-        "role": "tool",
-        "tool_name": name,
-        "content": result,
-    }
+    else:
+        message = {
+            "role": "tool",
+            "tool_name": name,
+            "content": content,
+        }
+    if display_directly:
+        message["display_directly"] = True
+        message["display_content"] = result
+        message["tool_failed"] = not ok
+    return message
 
 
 def _tool_summary(call: Dict[str, Any]) -> str:
@@ -1401,7 +1537,7 @@ def _assistant_message_from_parts(content: str, normalized_calls: List[Dict[str,
             }
             for call in normalized_calls
         ]
-        return assistant_message
+        return _sanitize_assistant_tool_preamble(assistant_message)
 
     assistant_message["tool_calls"] = [
         {
@@ -1414,7 +1550,7 @@ def _assistant_message_from_parts(content: str, normalized_calls: List[Dict[str,
         }
         for index, call in enumerate(normalized_calls)
     ]
-    return assistant_message
+    return _sanitize_assistant_tool_preamble(assistant_message)
 
 
 def _stream_chat_response(
@@ -1703,7 +1839,7 @@ def _session_export_markdown(messages: List[Dict[str, Any]], active_model: str =
             "",
         ])
 
-        content = message.get("content") or ""
+        content = _message_visible_content(message)
         if content:
             lines.extend([
                 content,
@@ -2159,7 +2295,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
             while True:
                 payload: Dict[str, Any] = {
                     "model": model,
-                    "messages": messages,
+                    "messages": _messages_for_model(messages),
                     "stream": True,
                 }
                 if use_openai:
@@ -2200,11 +2336,26 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 for call in normalized_calls:
                     print(f"[tool] { _tool_summary(call) }")
                     turn_has_visible_output = True
+                    tool_spec = TOOL_REGISTRY.get(call["name"], {})
+                    display_directly = bool(tool_spec.get("display_directly", False))
                     try:
                         result = execute_tool_call(call["name"], call["arguments"], guardrails_mode)
+                        tool_ok = not _tool_result_failed(result)
                     except Exception as exc:
                         result = _tool_error_message(exc)
-                    messages.append(_tool_result_message(call["name"], result, call["id"], use_openai))
+                        tool_ok = False
+                    if display_directly and _render_tool_output_direct(result):
+                        turn_has_visible_output = True
+                    messages.append(
+                        _tool_result_message_with_mode(
+                            call["name"],
+                            result,
+                            call["id"],
+                            use_openai,
+                            display_directly=display_directly,
+                            ok=tool_ok,
+                        )
+                    )
 
                 request_uses_tools = tools_active_for_turn
 

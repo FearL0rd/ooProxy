@@ -10,6 +10,237 @@ import json
 _DEFAULT_MAX_TOKENS = 32768
 
 
+def _tool_failed(content: str) -> bool:
+    if not content:
+        return False
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("return_code"), int):
+        return payload["return_code"] != 0
+    if payload.get("ok") is False:
+        return True
+    return bool(payload.get("error")) and payload.get("ok") is not True
+
+
+def _tool_return_code_payload(content: str) -> str:
+    return json.dumps({"return_code": 1 if _tool_failed(content) else 0}, ensure_ascii=False)
+
+
+def _wrap_tool_output(content: str) -> str:
+    return f"Exact tool output follows.\n~~~text\n{content}~~~"
+
+
+def _tool_output_for_model(content: str, *, display_directly: bool) -> str:
+    if display_directly:
+        return _tool_return_code_payload(content)
+    if "\n" in content or content.startswith((" ", "\t")) or content.endswith(("\n", " ", "\t")):
+        return _wrap_tool_output(content)
+    return content
+
+
+def _direct_display_content_for_model(content: str) -> str:
+    return content
+
+
+def _sanitize_tool_schema(tool: dict) -> tuple[dict | None, str | None]:
+    if not isinstance(tool, dict):
+        return None, None
+
+    sanitized = dict(tool)
+    direct_name: str | None = None
+
+    function = sanitized.get("function")
+    if isinstance(function, dict):
+        function_copy = dict(function)
+        if function_copy.get("display_directly") and isinstance(function_copy.get("name"), str):
+            direct_name = function_copy["name"]
+        function_copy.pop("display_directly", None)
+        sanitized["function"] = function_copy
+        return sanitized, direct_name
+
+    if sanitized.get("display_directly") and isinstance(sanitized.get("name"), str):
+        direct_name = sanitized["name"]
+    sanitized.pop("display_directly", None)
+    return sanitized, direct_name
+
+
+def _sanitize_tools(tools: object) -> tuple[list[dict] | None, set[str]]:
+    if not isinstance(tools, list):
+        return None, set()
+
+    sanitized_tools: list[dict] = []
+    direct_display_tools: set[str] = set()
+    for tool in tools:
+        sanitized, direct_name = _sanitize_tool_schema(tool)
+        if sanitized is not None:
+            sanitized_tools.append(sanitized)
+        if direct_name:
+            direct_display_tools.add(direct_name)
+    return sanitized_tools, direct_display_tools
+
+
+def _normalize_openai_messages(messages: list[dict], direct_display_tools: set[str]) -> list[dict]:
+    out: list[dict] = []
+    pending_tool_calls: list[dict] = []
+
+    for message_index, message in enumerate(messages):
+        role = message.get("role")
+
+        if role == "assistant" and message.get("tool_calls"):
+            tool_calls = [dict(tool_call) for tool_call in (message.get("tool_calls") or []) if isinstance(tool_call, dict)]
+            for tool_index, tool_call in enumerate(tool_calls):
+                function = tool_call.get("function") or {}
+                call_id = tool_call.get("id") or f"call_{message_index}_{tool_index}"
+                pending_tool_calls.append({"id": call_id, "name": function.get("name", "unknown_tool")})
+            normalized = dict(message)
+            normalized["tool_calls"] = tool_calls
+            out.append(normalized)
+            continue
+
+        if role == "tool":
+            normalized = dict(message)
+            tool_call_id = normalized.get("tool_call_id")
+            tool_name = normalized.get("tool_name") or normalized.get("name")
+            if not tool_name and tool_call_id:
+                matched = next((call for call in pending_tool_calls if call["id"] == tool_call_id), None)
+                if matched is not None:
+                    tool_name = matched["name"]
+            if not tool_name:
+                match_index = next((i for i, call in enumerate(pending_tool_calls) if call["name"]), None)
+                if match_index is not None:
+                    tool_name = pending_tool_calls[match_index]["name"]
+
+            content = normalized.get("content") or ""
+            string_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            is_direct_display = bool(tool_name and tool_name in direct_display_tools)
+            include_direct_display_content = is_direct_display and any(
+                isinstance(later_message, dict) and later_message.get("role") != "tool"
+                for later_message in messages[message_index + 1:]
+            )
+            if include_direct_display_content:
+                normalized["content"] = _direct_display_content_for_model(string_content)
+            else:
+                normalized["content"] = _tool_output_for_model(
+                    string_content,
+                    display_directly=is_direct_display,
+                )
+            normalized.pop("display_content", None)
+            normalized.pop("display_directly", None)
+            out.append(normalized)
+            continue
+
+        out.append(dict(message))
+
+    return out
+
+
+def _resolve_direct_display_tool_name(messages: list[dict], direct_display_tools: set[str], target_message: dict) -> str | None:
+    pending_tool_calls: list[dict] = []
+    for message_index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                call_id = tool_call.get("id") or f"call_{message_index}_{tool_index}"
+                pending_tool_calls.append({"id": call_id, "name": function.get("name", "unknown_tool")})
+            continue
+        if message is not target_message:
+            continue
+        tool_name = message.get("tool_name") or message.get("name")
+        if isinstance(tool_name, str) and tool_name in direct_display_tools:
+            return tool_name
+        tool_call_id = message.get("tool_call_id")
+        if tool_call_id:
+            matched = next((call for call in pending_tool_calls if call["id"] == tool_call_id and call["name"] in direct_display_tools), None)
+            if matched is not None:
+                return matched["name"]
+        return None
+    return None
+
+
+def direct_display_tool_reply(body: dict) -> str | None:
+    tools, direct_display_tools = _sanitize_tools(body.get("tools"))
+    if not direct_display_tools:
+        return None
+
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    last_message = messages[-1]
+    if not isinstance(last_message, dict) or last_message.get("role") != "tool":
+        return None
+
+    tool_name = _resolve_direct_display_tool_name(messages, direct_display_tools, last_message)
+    if not tool_name:
+        return None
+
+    content = last_message.get("display_content") if isinstance(last_message.get("display_content"), str) else last_message.get("content")
+    return content if isinstance(content, str) else None
+
+
+def sanitize_openai_chat_body(body: dict) -> dict:
+    sanitized_tools, direct_display_tools = _sanitize_tools(body.get("tools"))
+    out = dict(body)
+    messages = body.get("messages") or []
+    out["messages"] = _normalize_openai_messages(messages if isinstance(messages, list) else [], direct_display_tools)
+    if sanitized_tools is not None:
+        out["tools"] = sanitized_tools
+    else:
+        out.pop("tools", None)
+    return out
+
+
+def anthropic_direct_display_tool_reply(body: dict) -> str | None:
+    _, direct_display_tools = _sanitize_tools(body.get("tools"))
+    if not direct_display_tools:
+        return None
+
+    tool_use_names: dict[str, str] = {}
+    messages = body.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str) and isinstance(block.get("name"), str):
+                tool_use_names[block["id"]] = block["name"]
+
+    last_message = messages[-1]
+    if not isinstance(last_message, dict):
+        return None
+    content = last_message.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    last_block = content[-1]
+    if not isinstance(last_block, dict) or last_block.get("type") != "tool_result":
+        return None
+
+    tool_name = tool_use_names.get(last_block.get("tool_use_id"))
+    if tool_name not in direct_display_tools:
+        return None
+
+    result_content = last_block.get("content", "")
+    if isinstance(result_content, list):
+        return _anthropic_text_from_content(result_content)
+    if isinstance(result_content, str):
+        return result_content
+    return json.dumps(result_content, ensure_ascii=False)
+
+
 def _normalize_native_messages(messages: list[dict]) -> list[dict]:
     """Convert Ollama-style tool messages into OpenAI-compatible messages."""
     out: list[dict] = []
@@ -71,12 +302,13 @@ def _normalize_native_messages(messages: list[dict]) -> list[dict]:
 
 def chat_to_openai(body: dict) -> dict:
     """Convert an Ollama /api/chat request body to OpenAI /v1/chat/completions."""
+    sanitized_tools, direct_display_tools = _sanitize_tools(body.get("tools"))
     out: dict = {
         "model": body["model"],
-        "messages": _normalize_native_messages(body.get("messages", [])),
+        "messages": _normalize_openai_messages(_normalize_native_messages(body.get("messages", [])), direct_display_tools),
     }
-    if "tools" in body:
-        out["tools"] = body["tools"]
+    if sanitized_tools is not None:
+        out["tools"] = sanitized_tools
     if "tool_choice" in body:
         out["tool_choice"] = body["tool_choice"]
     if "stream" in body:
@@ -236,11 +468,12 @@ def _responses_input_to_messages(input_value: object) -> list[dict]:
 
 
 def _responses_tools_to_openai(tools: object) -> list[dict] | None:
-    if not isinstance(tools, list):
+    sanitized_tools, _ = _sanitize_tools(tools)
+    if sanitized_tools is None:
         return None
 
     converted: list[dict] = []
-    for tool in tools:
+    for tool in sanitized_tools:
         if not isinstance(tool, dict):
             continue
 
@@ -295,10 +528,12 @@ def responses_to_openai_chat(body: dict, previous_messages: list[dict] | None = 
             messages.insert(0, {"role": "system", "content": instructions})
 
     messages.extend(_responses_input_to_messages(body.get("input")))
+    _, direct_display_tools = _sanitize_tools(body.get("tools"))
+    sanitized_messages = _normalize_openai_messages(messages, direct_display_tools)
 
     out: dict = {
         "model": body["model"],
-        "messages": messages,
+        "messages": sanitized_messages,
         "stream": bool(body.get("stream", False)),
     }
     converted_tools = _responses_tools_to_openai(body.get("tools"))
@@ -339,6 +574,7 @@ def _anthropic_text_from_content(content: object) -> str:
 
 def anthropic_messages_to_openai_chat(body: dict) -> dict:
     """Convert Anthropic /v1/messages requests to OpenAI /v1/chat/completions."""
+    _, direct_display_tools = _sanitize_tools(body.get("tools"))
     messages: list[dict] = []
 
     system = body.get("system")
@@ -392,6 +628,7 @@ def anthropic_messages_to_openai_chat(body: dict) -> dict:
                     result_content = json.dumps(result_content, ensure_ascii=False)
                 tool_results.append({
                     "role": "tool",
+                    "name": block.get("name"),
                     "tool_call_id": block.get("tool_use_id") or f"toolu_{block_index}",
                     "content": result_content,
                 })
@@ -408,7 +645,7 @@ def anthropic_messages_to_openai_chat(body: dict) -> dict:
 
     out: dict = {
         "model": body["model"],
-        "messages": messages,
+        "messages": _normalize_openai_messages(messages, direct_display_tools),
         "stream": bool(body.get("stream", False)),
         "max_tokens": body.get("max_tokens") or _DEFAULT_MAX_TOKENS,
     }

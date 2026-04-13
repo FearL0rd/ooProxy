@@ -7,7 +7,7 @@ import logging
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from modules._server.translate.request import chat_to_openai
+from modules._server.translate.request import chat_to_openai, direct_display_tool_reply
 from modules._server.translate.response import openai_chat_to_ollama
 from modules._server.translate.stream import sse_to_ndjson
 from modules._server.upstream_errors import (
@@ -48,6 +48,12 @@ async def chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     model = body.get("model", "")
     streaming = body.get("stream", False)
     behavior_flags = _native_behavior_flags(request, model)
+    direct_reply = direct_display_tool_reply(body)
+
+    if direct_reply is not None:
+        if streaming:
+            return StreamingResponse(iter_ollama_chat_error_stream(model, direct_reply), media_type="application/x-ndjson")
+        return JSONResponse(synthetic_ollama_chat(model, direct_reply))
 
     logger.info("api/chat model=%s stream=%s msgs=%d",
                 model, streaming, len(body.get("messages", [])))
