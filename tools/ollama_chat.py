@@ -33,7 +33,8 @@ MAX_TOOL_OUTPUT_CHARS = 16000
 # the proxy's chat_to_openai() which already injects this value.
 DEFAULT_MAX_TOKENS = 32768
 EXTERNAL_TOOL_FILES: List[str] = []
-DEFAULT_RENDER_MODE = "markdown"
+DEFAULT_RENDER_MODE = "hybrid"
+RENDER_MODES = ("markdown", "stream", "hybrid")
 DEFAULT_GUARDRAILS_MODE = "confirm-destructive"
 TOOL_LOAD_EVENTS: List[Dict[str, str]] = []
 TOOL_LOAD_SUMMARY_SHOWN = False
@@ -296,6 +297,21 @@ def render_markdown_to_terminal(text: str, console: Any = None) -> None:
             pass
     # Fallback
     print(text)
+
+
+def _render_mode_streams_live(render_mode: str) -> bool:
+    return render_mode in {"stream", "hybrid"}
+
+
+def _render_mode_uses_markdown_pass(render_mode: str) -> bool:
+    return render_mode == "markdown"
+
+
+def _normalize_render_mode(value: str) -> str:
+    candidate = value.strip().lower()
+    if candidate not in RENDER_MODES:
+        raise ValueError(f"Unknown render mode: {value}")
+    return candidate
 
 
 def _supports_terminal_styles(stream: Any) -> bool:
@@ -1062,6 +1078,15 @@ def _print_turn_separator() -> None:
     print()
 
 
+def _redraw_conversation(messages: List[Dict[str, Any]], *, persist: bool = False) -> List[Dict[str, Any]]:
+    if persist:
+        save_context(messages)
+    print("\033c", end="")
+    if messages:
+        _replay_conversation(messages)
+    return messages
+
+
 def _print_question_line(text: str) -> None:
     lines = text.splitlines() or [""]
     print(f">>> {lines[0]}")
@@ -1320,7 +1345,7 @@ def _stream_chat_response(
     ollama_tool_buffers: Dict[int, Dict[str, Any]] = {}
     printed_content = False
     thinking_status_shown = _show_thinking_status()
-    stream_renderer = _ThinkingStreamRenderer(console=_RICH_CONSOLE) if render_mode == "stream" else None
+    stream_renderer = _ThinkingStreamRenderer(console=_RICH_CONSOLE) if _render_mode_streams_live(render_mode) else None
 
     def _mark_response_started() -> None:
         nonlocal thinking_status_shown
@@ -1348,7 +1373,7 @@ def _stream_chat_response(
                     content = message.get("content") or ""
                     if content:
                         _mark_response_started()
-                        if render_mode == "stream":
+                        if _render_mode_streams_live(render_mode):
                             printed_content = stream_renderer.feed(content) or printed_content
                         content_parts.append(content)
                     tool_calls = message.get("tool_calls") or []
@@ -1364,7 +1389,7 @@ def _stream_chat_response(
                 content = delta.get("content") or ""
                 if content:
                     _mark_response_started()
-                    if render_mode == "stream":
+                    if _render_mode_streams_live(render_mode):
                         printed_content = stream_renderer.feed(content) or printed_content
                     content_parts.append(content)
                 tool_calls = delta.get("tool_calls") or []
@@ -1382,7 +1407,7 @@ def _stream_chat_response(
             content = message.get("content") or ""
             if content:
                 _mark_response_started()
-                if render_mode == "stream":
+                if _render_mode_streams_live(render_mode):
                     printed_content = stream_renderer.feed(content) or printed_content
                 content_parts.append(content)
             tool_calls = message.get("tool_calls") or []
@@ -1763,6 +1788,7 @@ def _command_help_markdown(render_mode: str | None = None, guardrails_mode: str 
         "| /reset | Clear all context |",
         "| /compact | Summarize and shorten history |",
         "| /model [name] | Switch model; with no name, list available models |",
+        "| /render [mode] | View or switch render mode (`markdown`, `stream`, `hybrid`) |",
         "| /file <filename> | Add file to the next message |",
         "| /clearfiles | Clear attachment buffer |",
         "| /tools | List available local tools |",
@@ -1774,9 +1800,9 @@ def _command_help_markdown(render_mode: str | None = None, guardrails_mode: str 
         "Enter to submit. Alt-Enter, Shift-Enter, or Ctrl-J inserts a new line.",
     ]
     if render_mode is not None:
-        lines.append(f"Current render mode: {render_mode}")
+        lines.append(f"\nCurrent render mode: {render_mode}")
     if guardrails_mode is not None:
-        lines.append(f"Current guardrails: {guardrails_mode}")
+        lines.append(f"\nCurrent guardrails: {guardrails_mode}")
     return "\n".join(lines)
 
 
@@ -1857,7 +1883,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
             # treat it as a typo and do not forward to the model.
             known_cmds = {
                 '/exit', '/quit', '/bye',
-                '/export', '/reset', '/compact', '/model',
+                '/export', '/reset', '/compact', '/model', '/render',
                 '/file', '/clearfiles', '/status', '/sessions', '/tools', '/?', '/help',
                 '/redraw'
             }
@@ -1932,6 +1958,23 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 print(f"🔄 Model switched to: {model}")
                 continue
 
+            elif cmd == '/render':
+                if len(parts) < 2 or not parts[1].strip():
+                    print(f"🎨 Current render mode: {render_mode}")
+                    print(f"Available modes: {', '.join(RENDER_MODES)}")
+                    print("Usage: /render <markdown|stream|hybrid>")
+                    continue
+
+                requested_mode = parts[1].strip()
+                try:
+                    render_mode = _normalize_render_mode(requested_mode)
+                except ValueError:
+                    print(f"⚠️ Unknown render mode '{requested_mode}'. Available modes: {', '.join(RENDER_MODES)}")
+                    continue
+
+                print(f"🎨 Render mode switched to: {render_mode}")
+                continue
+
             elif cmd == '/file':
                 if len(parts) < 2:
                     print("Usage: /file <filename>")
@@ -1953,7 +1996,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
 
             elif cmd in ['/?', '/help']:
                 # Show available commands/help
-                _print_command_help()
+                _print_command_help(render_mode=render_mode, guardrails_mode=guardrails_mode)
                 continue
 
             elif cmd == '/clearfiles':
@@ -1962,14 +2005,9 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 continue
 
             elif cmd == '/redraw':
-                # Save any recent messages, clear screen, and reload context as if resuming
-                save_context(messages)
-                # Clear terminal screen (ANSI escape code)
-                print("\033c", end="")
-                # Reset attachment buffer
+                # Save and replay the current conversation from the terminal top.
                 ATTACHMENT_BUFFER.clear()
-                # Reload context (this will also print the previous conversation and set CONTINUE_SESSION)
-                messages = load_context()
+                messages = _redraw_conversation(messages, persist=True)
                 continue
 
             elif cmd == '/sessions':
@@ -2055,8 +2093,10 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                 content = assistant_message.get("content") or ""
                 if content:
                     turn_has_visible_output = True
-                if content and render_mode == "markdown":
+                if content and _render_mode_uses_markdown_pass(render_mode):
                     _render_message_text(content)
+                elif content and render_mode == "hybrid":
+                    messages = _redraw_conversation(messages)
 
                 if not normalized_calls:
                     if not content:
@@ -2110,7 +2150,7 @@ def main():
                         help="Start a new session with an empty context (alias for --new)")
     parser.add_argument("-t", "--tools", action="append", default=[], help="Path to a JSON file defining additional command-backed tools. Can be passed multiple times.")
     parser.add_argument("--no-tools", action="store_true", help="Disable local tool definitions for this session")
-    parser.add_argument("--render-mode", choices=["markdown", "stream"], default=DEFAULT_RENDER_MODE, help="How assistant replies are shown: buffered markdown view or live raw stream.")
+    parser.add_argument("--render-mode", choices=list(RENDER_MODES), default=DEFAULT_RENDER_MODE, help="How assistant replies are shown: buffered markdown view, live raw stream, or hybrid stream-then-markdown.")
     parser.add_argument("--guardrails", choices=["confirm-destructive", "read-only", "off"], default=DEFAULT_GUARDRAILS_MODE, help="How destructive tool calls are handled.")
     args = parser.parse_args()
 

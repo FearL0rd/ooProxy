@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Union
 
 logger = logging.getLogger("ooproxy")
+THINK_TAG_OPEN = "<think>"
+THINK_TAG_CLOSE = "</think>"
 
 
 def _now_iso() -> str:
@@ -22,6 +24,24 @@ def _parse_tool_arguments(raw: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def _extract_reasoning_text(payload: dict) -> str:
+    for key in ("reasoning_content", "reasoning"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _content_chunk(model: str, content: str) -> bytes:
+    chunk = {
+        "model": model,
+        "created_at": _now_iso(),
+        "message": {"role": "assistant", "content": content},
+        "done": False,
+    }
+    return (json.dumps(chunk) + "\n").encode()
 
 
 def _finalize_tool_calls(tool_call_buffers: dict[int, dict[str, str | int]]) -> list[dict]:
@@ -55,6 +75,7 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
     finish_reason_seen: str | None = None
     tool_call_buffers: dict[int, dict[str, str | int]] = {}
     tool_calls_emitted = False
+    reasoning_open = False
 
     async for raw in sse_stream:
         if isinstance(raw, bytes):
@@ -69,6 +90,9 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
         payload = line[6:]  # strip "data: "
 
         if payload == "[DONE]":
+            if reasoning_open:
+                yield _content_chunk(model, THINK_TAG_CLOSE)
+                reasoning_open = False
             tool_calls = _finalize_tool_calls(tool_call_buffers) if not tool_calls_emitted else []
             if tool_calls:
                 chunk = {
@@ -115,6 +139,9 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
             eval_count = usage.get("completion_tokens", 0)
             prompt_eval_count = usage.get("prompt_tokens", 0)
             usage_received = True
+            if reasoning_open:
+                yield _content_chunk(model, THINK_TAG_CLOSE)
+                reasoning_open = False
             tool_calls = _finalize_tool_calls(tool_call_buffers) if not tool_calls_emitted else []
             if tool_calls:
                 tool_chunk = {
@@ -151,6 +178,7 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
         choice = choices[0]
         delta = choice.get("delta", {})
         content = delta.get("content")
+        reasoning = _extract_reasoning_text(delta)
         tool_calls = delta.get("tool_calls") or []
         finish_reason = choice.get("finish_reason")
 
@@ -164,6 +192,9 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
                 )
 
         if tool_calls:
+            if reasoning_open:
+                yield _content_chunk(model, THINK_TAG_CLOSE)
+                reasoning_open = False
             for tool_call in tool_calls:
                 index = tool_call.get("index", 0)
                 buf = tool_call_buffers.setdefault(index, {"index": index, "name": "", "arguments": ""})
@@ -193,23 +224,33 @@ async def sse_to_ndjson(sse_stream: AsyncIterator[Union[str, bytes]], model: str
                 yield (json.dumps(chunk) + "\n").encode()
                 tool_calls_emitted = True
 
+        if reasoning:
+            if not reasoning_open:
+                yield _content_chunk(model, THINK_TAG_OPEN)
+                reasoning_open = True
+            yield _content_chunk(model, reasoning)
+
+        if isinstance(content, str) and content and reasoning_open:
+            yield _content_chunk(model, THINK_TAG_CLOSE)
+            reasoning_open = False
+
+        if finish_reason and content is None and reasoning_open:
+            yield _content_chunk(model, THINK_TAG_CLOSE)
+            reasoning_open = False
+
         # Skip finish_reason-only chunks (content is null/None)
         if finish_reason and content is None:
             continue
 
         # In-progress content chunk
-        if content is not None:
-            chunk = {
-                "model": model,
-                "created_at": _now_iso(),
-                "message": {"role": "assistant", "content": content},
-                "done": False,
-            }
-            yield (json.dumps(chunk) + "\n").encode()
+        if isinstance(content, str) and content:
+            yield _content_chunk(model, content)
 
     # Stream closed without [DONE] — emit a fallback done chunk so the client
     # gets a properly terminated NDJSON stream.
     if not usage_received:
+        if reasoning_open:
+            yield _content_chunk(model, THINK_TAG_CLOSE)
         done_reason = finish_reason_seen or "stop"
         logger.debug("stream ended without [DONE], emitting fallback done chunk (reason=%s)", done_reason)
         chunk = {

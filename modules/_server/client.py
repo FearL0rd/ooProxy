@@ -74,6 +74,37 @@ def _log_body(direction: str, body: dict) -> None:
     logger.debug("upstream %s %s", direction, preview)
 
 
+def _preview_text(text: str, limit: int = 600) -> str:
+    compact = text.replace("\r", "\\r").replace("\n", "\\n")
+    return compact[:limit] + ("…" if len(compact) > limit else "")
+
+
+def _log_stream_line(line: str | bytes) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if isinstance(line, bytes):
+        text = line.decode("utf-8", errors="replace")
+    else:
+        text = line
+    logger.debug("upstream SSE ← %s", _preview_text(text))
+
+
+class _TracedStreamResponse:
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    async def aiter_lines(self):
+        async for line in self._response.aiter_lines():
+            _log_stream_line(line)
+            yield line
+
+    async def aclose(self) -> None:
+        await self._response.aclose()
+
+    def __getattr__(self, name: str):
+        return getattr(self._response, name)
+
+
 # ---------------------------------------------------------------------------
 # Vendor-field stripping
 # ---------------------------------------------------------------------------
@@ -354,7 +385,7 @@ class OpenAIClient:
         Yields an async iterator of SSE lines as strings.
         Use as: ``async with client.stream_chat(body) as lines: ...``
         """
-        response = await self._open_stream("chat/completions", body)
+        response = _TracedStreamResponse(await self._open_stream("chat/completions", body))
         try:
             yield response.aiter_lines()
         finally:
@@ -366,7 +397,7 @@ class OpenAIClient:
         Returns the raw ``httpx.Response`` with the stream open.
         The caller MUST call ``response.aclose()`` when done (use try/finally).
         """
-        return await self._open_stream("chat/completions", body)
+        return _TracedStreamResponse(await self._open_stream("chat/completions", body))
 
     async def embeddings(self, body: dict) -> dict:
         """POST /v1/embeddings."""

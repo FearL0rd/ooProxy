@@ -29,6 +29,8 @@ class OllamaChatReplayTests(unittest.TestCase):
         self.assertIn("| Command | Action |", output)
         self.assertIn("/export <file>", output)
         self.assertIn("Export the whole session as raw Markdown", output)
+        self.assertIn("/render [mode]", output)
+        self.assertIn("markdown`, `stream`, `hybrid`", output)
         self.assertIn("/redraw", output)
         self.assertIn("Clear the screen and replay the saved conversation", output)
         self.assertEqual(stdout.getvalue(), "\n")
@@ -113,6 +115,85 @@ class OllamaChatReplayTests(unittest.TestCase):
             self.assertIn("hello", exported)
             self.assertIn("## 2. Assistant", exported)
             self.assertIn("# Hi", exported)
+
+    def test_render_command_switches_mode_without_restart(self) -> None:
+        class FakePromptSession:
+            def __init__(self, responses: list[str]) -> None:
+                self._responses = iter(responses)
+
+            def prompt(self, _prompt: str) -> str:
+                return next(self._responses)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ollama_chat.HISTORY_FILE = f"{tmpdir}/history"
+            ollama_chat.CURRENT_SESSION_ID = "session-render"
+            ollama_chat.CONTINUE_SESSION = False
+
+            with patch("tools.ollama_chat.load_context", return_value=[]), \
+                 patch("tools.ollama_chat.save_context", return_value=0), \
+                 patch("tools.ollama_chat.PromptSession", return_value=FakePromptSession(["/render hybrid", "/status", "/exit"])), \
+                 patch("sys.stdout", new_callable=StringIO) as stdout:
+                ollama_chat.chat_with_ollama(
+                    "llama3.2",
+                    "http://localhost:11434",
+                    use_openai=False,
+                    enable_tools=True,
+                    render_mode="markdown",
+                    guardrails_mode="confirm-destructive",
+                )
+
+        output = stdout.getvalue()
+        self.assertIn("🎨 Render mode switched to: hybrid", output)
+        self.assertIn("🎨 Render Mode: hybrid", output)
+
+    def test_hybrid_mode_streams_live_then_renders_markdown(self) -> None:
+        class FakePromptSession:
+            def __init__(self, responses: list[str]) -> None:
+                self._responses = iter(responses)
+
+            def prompt(self, _prompt: str) -> str:
+                return next(self._responses)
+
+        assistant_message = {"role": "assistant", "content": "# Answer\n\nBody"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ollama_chat.HISTORY_FILE = f"{tmpdir}/history"
+            ollama_chat.CURRENT_SESSION_ID = "session-hybrid"
+            ollama_chat.CONTINUE_SESSION = False
+
+            with patch("tools.ollama_chat.load_context", return_value=[]), \
+                 patch("tools.ollama_chat.save_context", return_value=1), \
+                 patch("tools.ollama_chat.PromptSession", return_value=FakePromptSession(["hello", "/exit"])), \
+                 patch("tools.ollama_chat._stream_chat_response", return_value=(assistant_message, [], True)) as stream_response, \
+                 patch("tools.ollama_chat._render_message_text") as render_message, \
+                 patch("tools.ollama_chat._redraw_conversation", side_effect=lambda messages, persist=False: messages) as redraw_conversation, \
+                 patch("sys.stdout", new_callable=StringIO):
+                ollama_chat.chat_with_ollama(
+                    "llama3.2",
+                    "http://localhost:11434",
+                    use_openai=False,
+                    enable_tools=True,
+                    render_mode="hybrid",
+                    guardrails_mode="confirm-destructive",
+                )
+
+        self.assertEqual(stream_response.call_args.kwargs["render_mode"], "hybrid")
+        render_message.assert_not_called()
+        redraw_conversation.assert_called_once()
+
+    def test_redraw_conversation_replays_current_messages(self) -> None:
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "# Hi"},
+        ]
+
+        with patch("tools.ollama_chat._replay_conversation") as replay_conversation, \
+             patch("sys.stdout", new_callable=StringIO) as stdout:
+            result = ollama_chat._redraw_conversation(messages)
+
+        self.assertIs(result, messages)
+        self.assertEqual(stdout.getvalue(), "\033c")
+        replay_conversation.assert_called_once_with(messages)
 
     def test_markdown_renderer_trims_rich_padding_lines(self) -> None:
         buffer = StringIO()

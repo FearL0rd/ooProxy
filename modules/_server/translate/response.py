@@ -8,6 +8,10 @@ import uuid
 from datetime import datetime, timezone
 
 
+THINK_TAG_OPEN = "<think>"
+THINK_TAG_CLOSE = "</think>"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
@@ -24,6 +28,14 @@ def _parse_arguments(raw: object) -> dict:
             return {"_raw": raw}
         return parsed if isinstance(parsed, dict) else {"value": parsed}
     return {"value": raw}
+
+
+def _extract_reasoning_text(payload: dict) -> str:
+    for key in ("reasoning_content", "reasoning"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _tool_calls_to_ollama(tool_calls: list[dict]) -> list[dict]:
@@ -46,9 +58,13 @@ def openai_chat_to_ollama(data: dict, model: str) -> dict:
     choice = data["choices"][0]
     message = choice.get("message", {})
     usage = data.get("usage", {})
+    reasoning = _extract_reasoning_text(message)
+    content = message.get("content") or ""
+    if reasoning:
+        content = f"{THINK_TAG_OPEN}{reasoning}{THINK_TAG_CLOSE}{content}"
     ollama_message = {
         "role": message.get("role", "assistant"),
-        "content": message.get("content") or "",
+        "content": content,
     }
     if message.get("tool_calls"):
         ollama_message["tool_calls"] = _tool_calls_to_ollama(message["tool_calls"])
