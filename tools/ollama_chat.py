@@ -781,8 +781,8 @@ def _tool_command_handler_factory(name: str, command_spec: Dict[str, Any]) -> To
             env=env,
         )
 
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+        stdout = result.stdout.rstrip("\r\n")
+        stderr = result.stderr.rstrip("\r\n")
         if result.returncode != 0:
             raise RuntimeError(_json_result({
                 "command": command if command else argv,

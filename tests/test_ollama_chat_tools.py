@@ -240,6 +240,39 @@ class OllamaChatToolLoadingTests(unittest.TestCase):
             self.assertEqual(result, "hello")
             self.assertEqual(ollama_chat.TOOL_LOAD_WARNINGS, [])
 
+    def test_external_tool_preserves_leading_spaces_in_multiline_output(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as cwd_dir:
+            tool_file = Path(home_dir) / ".ooProxy" / "tools" / "indent.json"
+            tool_file.parent.mkdir(parents=True)
+            tool_file.write_text(
+                json.dumps({
+                    "type": "function",
+                    "function": {
+                        "name": "indented_echo",
+                        "description": "Emit indented multiline output.",
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                    "argv": [
+                        "python3",
+                        "-c",
+                        "import sys; sys.stdout.write('  top\\n  next\\n')",
+                    ],
+                    "read_only": True,
+                }),
+                encoding="utf-8",
+            )
+
+            with patch("tools.ollama_chat.Path.home", return_value=Path(home_dir)), \
+                 patch("tools.ollama_chat.os.getcwd", return_value=cwd_dir):
+                ollama_chat.configure_tool_registry([])
+                result = ollama_chat.execute_tool_call("indented_echo", {}, "off")
+
+            self.assertEqual(result, "  top\n  next")
+
     def test_invalid_external_tool_file_is_skipped_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as cwd_dir:
             valid_file = Path(home_dir) / ".ooProxy" / "tools" / "valid.json"
