@@ -145,6 +145,8 @@ python ooproxy.py --list --json
 
 `tools/ollama_chat.py` supports built-in tools plus additional external tools loaded from JSON files with `-t/--tools`.
 
+For the external tool-file schema and the process for researching or implementing a new tool definition, see `examples/tools.md`.
+
 It also keeps resumable per-folder sessions under `~/.ooProxy/sessions/`.
 
 Example:
@@ -274,7 +276,7 @@ python ooproxy.py -s --url https://integrate.api.nvidia.com/v1 --key nvapi-...
 python ooproxy.py -s --url http://localhost:11434/v1
 ```
 
-ooProxy also ships static endpoint profiles in `endpoints/*.json` for known providers, currently including NVIDIA NIM, OpenRouter, Together AI, and local Ollama. These profiles preconfigure things like model-list path normalization, streaming mode, tool defaults, and readiness probes so the proxy can avoid trial-and-error when the upstream host is already known.
+ooProxy also ships static endpoint profiles in `endpoints/*.json` for known providers, currently including NVIDIA NIM, OpenRouter, Together AI, Fireworks AI, and local Ollama. For the endpoint profile schema and the process for researching or implementing a new provider profile, see `endpoints/endpoints.md`.
 
 ---
 
@@ -358,7 +360,7 @@ modules/
   list.py               # -l/--list   list remote models
   _server/              # Internal server package (not exposed as CLI modules)
     app.py              # FastAPI application factory
-    endpoint_profiles.py # Provider-specific endpoint behavior detection
+    endpoint_profiles.py # Static endpoint profile loading and matching
     client.py           # Async HTTP client for the remote backend
     config.py           # ProxyConfig (URL, key, port)
     handlers/           # Route handlers for each Ollama endpoint

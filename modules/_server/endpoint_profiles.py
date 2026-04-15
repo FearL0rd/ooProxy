@@ -57,8 +57,14 @@ class EndpointProfile:
     host_suffixes: tuple[str, ...] = field(default_factory=tuple)
     ports: tuple[int, ...] = field(default_factory=tuple)
     path_prefixes: tuple[str, ...] = field(default_factory=tuple)
+    models_method: str = "GET"
     models_path: str = "models"
     models_format: str = "openai"
+    models_variables: dict[str, dict[str, str]] = field(default_factory=dict)
+    models_items_path: str = ""
+    models_fields: dict[str, str] = field(default_factory=dict)
+    models_owned_by: str | None = None
+    models_capabilities: dict[str, Any] = field(default_factory=dict)
     chat_path: str = "chat/completions"
     chat_streaming: str = "sse"
     chat_tools: str = "trial"
@@ -99,8 +105,31 @@ def _profile_from_json(path: Path, raw: dict[str, Any]) -> EndpointProfile:
         host_suffixes=_normalize_string_list(match.get("host_suffixes")),
         ports=_normalize_port_list(match.get("ports")),
         path_prefixes=tuple(str(value).strip() for value in match.get("path_prefixes", []) if str(value).strip()),
+        models_method=str(models.get("method") or "GET").upper(),
         models_path=str(models.get("path") or "models"),
         models_format=str(models.get("format") or "openai"),
+        models_variables={
+            str(name): {
+                "method": str(config.get("method") or "GET").upper(),
+                "path": str(config.get("path") or ""),
+                "json_path": str(config.get("json_path") or ""),
+                "strip_prefix": str(config.get("strip_prefix") or ""),
+            }
+            for name, config in (models.get("variables") or {}).items()
+            if isinstance(name, str) and isinstance(config, dict)
+        },
+        models_items_path=str(models.get("items_path") or ""),
+        models_fields={
+            str(name): str(value)
+            for name, value in (models.get("fields") or {}).items()
+            if isinstance(name, str) and isinstance(value, (str, int, float))
+        },
+        models_owned_by=str(models.get("owned_by")) if models.get("owned_by") else None,
+        models_capabilities={
+            str(name): value
+            for name, value in (models.get("capabilities") or {}).items()
+            if isinstance(name, str)
+        },
         chat_path=str(chat.get("path") or "chat/completions"),
         chat_streaming=str(chat.get("streaming") or "sse").strip().lower(),
         chat_tools=str(chat.get("tools") or "trial").strip().lower(),

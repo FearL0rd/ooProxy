@@ -1,0 +1,46 @@
+{
+  "id": "fireworks_ai",
+  "match": {
+    "host_equals": ["api.fireworks.ai"],
+    "path_prefixes": ["/inference/v1"]
+  },
+  "models": {
+    "method": "GET",
+    "path": "/v1/accounts/{account_id}/models",
+    "format": "object_list",
+    "variables": {
+      "account_id": {
+        "method": "GET",
+        "path": "/v1/accounts",
+        "json_path": "accounts.0.name",
+        "strip_prefix": "accounts/"
+      }
+    },
+    "items_path": "models",
+    "owned_by": "fireworks",
+    "fields": {
+      "id": "name",
+      "created": "createTime",
+      "modified_at": "updateTime",
+      "context_length": "contextLength",
+      "parent_model": "importedFrom"
+    },
+    "capabilities": {
+      "embedding_when": {
+        "path": "kind",
+        "equals": "EMBEDDING_MODEL"
+      },
+      "completion_when_any_present": ["conversationConfig", "contextLength"],
+      "tools_when_truthy": "supportsTools"
+    }
+  },
+  "health": {
+    "mode": "internal-ready"
+  },
+  "chat": {
+    "path": "chat/completions",
+    "streaming": "sse",
+    "tools": "supported",
+    "system_prompt": "supported"
+  }
+}

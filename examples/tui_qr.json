@@ -1,0 +1,26 @@
+{
+  "type": "function",
+  "function": {
+    "name": "show_qr_tui",
+    "description": "Show a TUI/ASCII QR code for the supplied text or URL in the terminal.",
+    "display_directly": true,
+    "read_only": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The payload to turn into a QR code (URL, text, Wi‑Fi, etc.)"
+        }
+      },
+      "required": ["text"]
+    },
+    "argv": [
+      "python3",
+      "tui_qr.py",
+      "--text",   "{text}"
+    ],
+    "cwd": ".",
+    "timeout": 30
+  }
+}
