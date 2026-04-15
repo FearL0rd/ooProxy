@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import uvicorn
 
@@ -50,19 +51,56 @@ SPEC = ModuleSpec(
         "ooproxy.py -s --host 0.0.0.0 --port 11434",
     ),
 )
+
+
+class _ColorFormatter(logging.Formatter):
+    _RESET = "\033[0m"
+    _COLORS = {
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[32m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR: "\033[31m",
+        logging.CRITICAL: "\033[35m",
+    }
+
+    def __init__(self, fmt: str, *, use_color: bool) -> None:
+        super().__init__(fmt)
+        self._use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        original_levelname = record.levelname
+        if self._use_color:
+            color = self._COLORS.get(record.levelno)
+            if color:
+                record.levelname = f"{color}{original_levelname}{self._RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+
+
+def _configure_root_logging(level: int) -> None:
+    handler = logging.StreamHandler()
+    use_color = bool(getattr(handler.stream, "isatty", lambda: False)())
+    handler.setFormatter(_ColorFormatter("%(levelname)s %(name)s: %(message)s", use_color=use_color))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
 def _configure_logging(debug: bool, verbose: bool) -> str:
     """Set up logging levels and return the uvicorn log_level string."""
-    fmt = "%(levelname)s %(name)s: %(message)s"
     if debug:
-        logging.basicConfig(level=logging.DEBUG, format=fmt, force=True)
+        _configure_root_logging(logging.DEBUG)
         return "debug"
     if verbose:
-        logging.basicConfig(level=logging.INFO, format=fmt, force=True)
+        _configure_root_logging(logging.INFO)
         # Keep httpcore quiet even in verbose mode — it's very noisy
         logging.getLogger("httpcore").setLevel(logging.WARNING)
         return "info"
     # Default: show ooproxy INFO, suppress third-party chatter
-    logging.basicConfig(level=logging.WARNING, format=fmt, force=True)
+    _configure_root_logging(logging.WARNING)
     logging.getLogger("ooproxy").setLevel(logging.INFO)
     logging.getLogger("uvicorn.error").setLevel(logging.INFO)
     logging.getLogger("uvicorn.access").setLevel(logging.INFO)

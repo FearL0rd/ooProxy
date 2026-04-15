@@ -95,7 +95,7 @@ Global flags available to all CLI commands:
 - `-j, --json` — emit JSON envelopes from CLI commands
 - `-v, --verbose` — show more detail in CLI output and server logs
 - `-d, --debug` — enable debug logging (implies `--verbose`)
-- `--version` — print the ooProxy release version (`v1.0`)
+- `--version` — print the ooProxy release version (`v1.0.1`)
 
 Bundled tool scripts expose the same release tag:
 
@@ -109,6 +109,53 @@ python tools/ooproxy_keys.py --version
 If `--key` and `OPENAI_API_KEY` are both omitted, ooProxy looks up a stored key in `~/.ooProxy/keys.json` using the host portion of the remote URL.
 
 When `--serve` is started without `--url`, ooProxy scans the shipped `endpoints/*.json` profiles and offers the profiled URLs whose host or host:port already has a stored key. If no profiled stored endpoint is available, `--serve` exits and asks for `--url` explicitly.
+
+### Start the proxy in cascade mode
+
+```bash
+python ooproxy.py --cascade
+```
+
+`--cascade` is a separate top-level mode and cannot be combined with `--serve` or `--list`.
+
+Cascade mode reads its full configuration from `~/.ooProxy/cascade.json`. In this mode, clients request the configured weak model name, ooProxy makes the weak/strong routing decision internally, and the client only ever sees the weak model name in model lists and responses.
+
+Example `~/.ooProxy/cascade.json`:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 11434,
+  "decision": {
+    "threshold": 0.72,
+    "timeout_seconds": 3.0,
+    "max_tokens": 96
+  },
+  "routes": [
+    {
+      "weak_model": "qwen2.5:7b",
+      "strong_model": "qwen2.5:32b",
+      "url": "http://localhost:11434/v1"
+    },
+    {
+      "weak_model": "openai/gpt-4.1-mini",
+      "strong_model": "openai/gpt-4.1",
+      "weak_url": "https://api.openai.com/v1",
+      "strong_url": "https://api.openai.com/v1",
+      "weak_key": "env:OPENAI_API_KEY",
+      "strong_key": "env:OPENAI_API_KEY"
+    }
+  ]
+}
+```
+
+Notes:
+
+- `url` and `key` are shared shorthands for routes where weak and strong models use the same upstream.
+- If `weak_key` or `strong_key` is omitted, ooProxy falls back to `key`, then to any matching entry in `~/.ooProxy/keys.json`.
+- If your NVIDIA or other upstream keys are already stored in `~/.ooProxy/keys.json`, you can omit all key fields from `cascade.json` entirely.
+- `/v1/models`, `/api/tags`, and `/api/show` expose only the configured weak models in cascade mode.
+- If the weak-model routing decision fails or the weak upstream request fails before a response starts, ooProxy falls back to the configured strong model internally.
 
 ---
 

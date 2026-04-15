@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from modules._server.behavior import BehaviorCache
+from modules._server.cascade_client import CascadeClient
 from modules._server.client import OpenAIClient
 from modules._server.config import ProxyConfig
 from modules._server.handlers.chat import chat_handler
@@ -136,10 +137,16 @@ async def _readyz(request: Request) -> JSONResponse:
 def create_app(config: ProxyConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.client = OpenAIClient(config)
-        app.state.base_url = config.url     # canonical upstream URL for behavior cache keys
-        app.state.endpoint_profile = app.state.client.endpoint_profile
-        app.state.behavior = BehaviorCache()
+        if config.cascade is None:
+            app.state.client = OpenAIClient(config)
+            app.state.base_url = config.url
+            app.state.endpoint_profile = app.state.client.endpoint_profile
+            app.state.behavior = BehaviorCache()
+        else:
+            app.state.client = CascadeClient(config)
+            app.state.base_url = ""
+            app.state.endpoint_profile = None
+            app.state.behavior = None
         app.state.responses_store = {}      # explicit — avoids lazy init scattered in handlers
         yield
         aclose = getattr(app.state.client, "aclose", None)
