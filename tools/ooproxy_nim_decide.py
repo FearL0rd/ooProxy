@@ -175,7 +175,8 @@ def _extract_confidence(payload: dict) -> float | None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    parse = parser.parse_intermixed_args if hasattr(parser, "parse_intermixed_args") else parser.parse_args
+    args = parse(argv)
 
     url, key, decision = _resolve_defaults(args)
     if not key:
