@@ -23,6 +23,7 @@ All supported top-level items are shown below. Any omitted item falls back to th
 {
   "id": "provider_name",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["api.example.com"],
     "host_suffixes": ["example.com"],
     "ports": [443],
@@ -98,6 +99,15 @@ Use a stable snake_case name such as `openrouter`, `together_ai`, or `fireworks_
 - Purpose: describes how ooProxy matches a configured base URL to this profile
 
 All populated match constraints are combined with logical AND. Inside each list, any listed value may match.
+
+#### `match.schemes`
+
+- Type: array of strings
+- Example: `["https"]`
+- Match rule: the URL scheme must equal one of these values, case-insensitive
+- Default: no scheme constraint
+
+Use this when the canonical endpoint is restricted to `http` or `https` and the profile should not match the other transport.
 
 #### `match.host_equals`
 
@@ -451,10 +461,11 @@ You need:
 
 This determines `match.host_equals`, `match.host_suffixes`, and `match.path_prefixes`.
 
-### 2. Whether host and port are distinctive
+### 2. Whether scheme, host, and port are distinctive
 
 You need:
 
+- the expected scheme, if the provider is only valid over `http` or `https`
 - exact hostnames, if the provider uses fixed public hosts
 - suffix matching, if the provider serves multiple subdomains
 - explicit port requirements, if the endpoint is local or self-hosted
@@ -543,7 +554,7 @@ This determines `behavior`.
 3. Check chat completions with and without `stream=true`.
 4. Check tool calling with a minimal single-function example.
 5. Check a request containing a `system` message.
-6. If the endpoint is local or self-hosted, confirm whether port matching is needed.
+6. Confirm whether scheme matching is needed and whether the endpoint requires a non-default port.
 7. Add only the fields that are known and stable; rely on defaults for the rest.
 8. Add or update a targeted test in `tests/test_endpoint_profiles.py`.
 
@@ -565,7 +576,9 @@ For a normal OpenAI-compatible provider with a unique host and no quirks:
 {
   "id": "example_provider",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["api.example.com"],
+    "ports": [443],
     "path_prefixes": ["/v1"]
   },
   "chat": {

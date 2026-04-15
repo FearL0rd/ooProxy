@@ -53,6 +53,7 @@ def _host_matches(host: str, suffix: str) -> bool:
 class EndpointProfile:
     id: str
     source_path: str
+    schemes: tuple[str, ...] = field(default_factory=tuple)
     host_equals: tuple[str, ...] = field(default_factory=tuple)
     host_suffixes: tuple[str, ...] = field(default_factory=tuple)
     ports: tuple[int, ...] = field(default_factory=tuple)
@@ -77,10 +78,13 @@ class EndpointProfile:
 
     def matches(self, base_url: str) -> bool:
         parsed = urlparse(base_url)
+        scheme = (parsed.scheme or "").lower()
         host = (parsed.hostname or "").lower()
         port = parsed.port or _default_port_for_scheme(parsed.scheme)
         path = parsed.path or "/"
 
+        if self.schemes and scheme not in self.schemes:
+            return False
         if self.host_equals and host not in self.host_equals:
             return False
         if self.host_suffixes and not any(_host_matches(host, suffix) for suffix in self.host_suffixes):
@@ -101,6 +105,7 @@ def _profile_from_json(path: Path, raw: dict[str, Any]) -> EndpointProfile:
     return EndpointProfile(
         id=str(raw.get("id") or path.stem),
         source_path=str(path),
+        schemes=_normalize_string_list(match.get("schemes")),
         host_equals=_normalize_string_list(match.get("host_equals")),
         host_suffixes=_normalize_string_list(match.get("host_suffixes")),
         ports=_normalize_port_list(match.get("ports")),

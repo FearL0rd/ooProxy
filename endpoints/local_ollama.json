@@ -1,6 +1,7 @@
 {
   "id": "local_ollama",
   "match": {
+    "schemes": ["http"],
     "host_equals": ["localhost", "127.0.0.1"],
     "ports": [11434]
   },

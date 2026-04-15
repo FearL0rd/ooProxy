@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+
 import uvicorn
 
-from cli_contract import CommandError, ModuleSpec, OptionSpec, ResultEnvelope, command_result
+from cli_contract import ModuleSpec, OptionSpec, ResultEnvelope, command_result
 from modules._server.app import create_app
 from modules._server.config import ProxyConfig
+from modules._server.endpoint_selection import resolve_profile_url
 
 SPEC = ModuleSpec(
     name="serve",
@@ -44,12 +46,10 @@ SPEC = ModuleSpec(
     usage_examples=(
         "ooproxy.py -s --url https://integrate.api.nvidia.com/v1 --key nvapi-xxx",
         "ooproxy.py -s --url http://myserver:8080/v1 --key sk-xxx",
+        "ooproxy.py -s  # select from keyed endpoint profiles",
         "ooproxy.py -s --host 0.0.0.0 --port 11434",
-        "OPENAI_BASE_URL=https://... OPENAI_API_KEY=sk-... ooproxy.py -s",
     ),
 )
-
-
 def _configure_logging(debug: bool, verbose: bool) -> str:
     """Set up logging levels and return the uvicorn log_level string."""
     fmt = "%(levelname)s %(name)s: %(message)s"
@@ -75,6 +75,7 @@ def run(args) -> ResultEnvelope:
     debug = getattr(args, "debug", False)
     verbose = getattr(args, "verbose", False) or debug
     uv_log_level = _configure_logging(debug, verbose)
+    args.url = resolve_profile_url(args)
     config = ProxyConfig.from_args(args)
     app = create_app(config)
     host = getattr(args, "host", "127.0.0.1")

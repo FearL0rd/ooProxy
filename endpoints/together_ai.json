@@ -1,8 +1,10 @@
 {
   "id": "together_ai",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["api.together.xyz"],
-    "host_suffixes": ["together.xyz"]
+    "host_suffixes": ["together.xyz"],
+    "ports": [443]
   },
   "models": {
     "path": "models",

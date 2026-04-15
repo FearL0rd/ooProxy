@@ -25,6 +25,7 @@ HISTORY_FILE = ""
 LOCK_FILE = ""
 CURRENT_SESSION_ID = ""
 LAUNCH_COMMAND_PREFIX = ""
+CHAT_SCRIPT_NAMES = ("ooproxy_chat.py", "ollama_chat.py")
 
 ATTACHMENT_BUFFER: List[str] = []
 DEFAULT_TOOL_TIMEOUT = 120
@@ -104,7 +105,7 @@ def _write_session_meta(session_id: str, **updates: Any) -> None:
 
 
 def _session_locked(session_id: str) -> bool:
-    """Return True if the session is held by a live ollama_chat process."""
+    """Return True if the session is held by a live chat CLI process."""
     lock = _session_dir(session_id) / "lock"
     if not lock.exists():
         return False
@@ -248,7 +249,7 @@ CONTINUE_SESSION = False
 
 
 def _looks_like_chat_script(path: str) -> bool:
-    return os.path.basename(path) == "ollama_chat.py"
+    return os.path.basename(path) in CHAT_SCRIPT_NAMES
 
 
 def _capture_launch_command_prefix() -> None:
@@ -1723,7 +1724,7 @@ def _pid_alive(pid: int) -> bool:
 def _is_ollama_chat_process(pid: int) -> bool:
     """Heuristic: return True if PID's command or cwd looks like this chat tool.
 
-    Checks /proc/<pid>/cmdline for this script name or 'ollama_chat', and
+    Checks /proc/<pid>/cmdline for this script name or the legacy/new chat CLI names, and
     /proc/<pid>/cwd for matching working directory. Returns False if the
     checks fail or indicate a different program.
     """
@@ -1735,9 +1736,10 @@ def _is_ollama_chat_process(pid: int) -> bool:
                 raw = f.read()
             # cmdline is null-separated
             parts = [p.decode(errors="ignore") for p in raw.split(b"\0") if p]
-            script_name = os.path.basename(__file__)
+            script_names = {os.path.basename(__file__), *CHAT_SCRIPT_NAMES}
             for p in parts:
-                if script_name in p or "ollama_chat" in p.lower():
+                lowered = p.lower()
+                if any(name in p for name in script_names) or "ollama_chat" in lowered or "ooproxy_chat" in lowered:
                     return True
 
         # Check cwd matches current working directory
@@ -1776,12 +1778,12 @@ def acquire_pidfile(lockfile: Optional[str] = None) -> None:
             existing = None
 
         if existing and _pid_alive(existing):
-            # If the running PID appears to be an ollama_chat process, respect it.
+            # If the running PID appears to be this chat CLI, respect it.
             if _is_ollama_chat_process(existing):
                 print(f"⛔ Another session (PID {existing}) is using this folder. Exiting.")
                 sys.exit(1)
             # Otherwise treat as stale and attempt to reclaim
-            print(f"⚠️ Lock held by PID {existing} which is not an ollama_chat instance; reclaiming lock.")
+            print(f"⚠️ Lock held by PID {existing} which is not an ooproxy_chat instance; reclaiming lock.")
 
         # stale lock: remove and retry once
         try:
@@ -2310,7 +2312,7 @@ def chat_with_ollama(model: str, base_url: str, use_openai: bool, enable_tools: 
                         active = " ← current" if s["id"] == CURRENT_SESSION_ID else ""
                         locked = " [in use]" if s["locked"] and s["id"] != CURRENT_SESSION_ID else ""
                         print(f"  {s['id']}  {m:<30}  {ts}  ({count} msgs){active}{locked}")
-                    print(f"\nResume with: ollama_chat <model> -r <session-id>")
+                    print(f"\nResume with: ooproxy_chat <model> -r <session-id>")
                 print()
                 continue
 

@@ -1,7 +1,9 @@
 {
   "id": "fireworks_ai",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["api.fireworks.ai"],
+    "ports": [443],
     "path_prefixes": ["/inference/v1"]
   },
   "models": {

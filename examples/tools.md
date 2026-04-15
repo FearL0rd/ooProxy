@@ -1,6 +1,6 @@
 # Tool Definition Files
 
-This folder can contain example JSON files for external tools loaded by `tools/ollama_chat.py`.
+This folder can contain example JSON files for external tools loaded by `tools/ooproxy_chat.py`.
 
 Tool files are data-driven. They describe command-backed tools that the chat CLI exposes to the model at runtime.
 
@@ -362,7 +362,7 @@ If you want a tool to run automatically in normal guarded sessions, mark it `rea
 
 ## Discovery And Override Order
 
-By default, `tools/ollama_chat.py` loads tool files in this order:
+By default, `tools/ooproxy_chat.py` loads tool files in this order:
 
 1. `~/.ooProxy/tools/*.json`
 2. `./.ooProxy/tools/*.json`
@@ -432,7 +432,7 @@ This determines `timeout`, `read_only`, and `destructive`.
 4. Mark the tool `read_only` only if it truly has no side effects.
 5. If output should be shown directly to the user, set `display_directly: true`.
 6. If the tool logic grows, move it into a companion Python script.
-7. Test the tool from `tools/ollama_chat.py` with a real prompt and verify argument passing, cwd handling, and guardrails.
+7. Test the tool from `tools/ooproxy_chat.py` with a real prompt and verify argument passing, cwd handling, and guardrails.
 
 ## Implementation Rules
 

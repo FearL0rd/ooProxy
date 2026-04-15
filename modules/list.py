@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from cli_contract import ModuleSpec, OptionSpec, ResultEnvelope, command_result
 from modules._server.client import OpenAIClient
 from modules._server.config import ProxyConfig
+from modules._server.endpoint_selection import resolve_profile_url
 
 SPEC = ModuleSpec(
     name="list",
@@ -30,7 +31,7 @@ SPEC = ModuleSpec(
     ),
     usage_examples=(
         "ooproxy.py -l --url https://integrate.api.nvidia.com/v1 --key nvapi-xxx",
-        "ooproxy.py -l  # uses OPENAI_BASE_URL and OPENAI_API_KEY env vars",
+        "ooproxy.py -l  # select from keyed endpoint profiles",
     ),
 )
 
@@ -45,6 +46,7 @@ async def _fetch_models(config: ProxyConfig) -> list[dict]:
 
 
 def run(args) -> ResultEnvelope:
+    args.url = resolve_profile_url(args)
     config = ProxyConfig.from_args(args)
     models = asyncio.run(_fetch_models(config))
     result = command_result("list", config.url, data=models)

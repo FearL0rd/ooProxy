@@ -1,7 +1,9 @@
 {
   "id": "nvidia_nim",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["integrate.api.nvidia.com", "ai.api.nvidia.com"],
+    "ports": [443],
     "path_prefixes": ["/v1", "/"]
   },
   "models": {

@@ -61,7 +61,7 @@ python ooproxy.py --serve \
 Or store the remote key once and let ooProxy resolve it from the remote URL host:
 
 ```bash
-python tools/ollama_keys.py --host integrate.api.nvidia.com --key nvapi-YOUR_KEY_HERE
+python tools/ooproxy_keys.py --host integrate.api.nvidia.com --key nvapi-YOUR_KEY_HERE
 python ooproxy.py --serve --url https://integrate.api.nvidia.com/v1
 ```
 
@@ -85,7 +85,7 @@ Health and readiness endpoints are also available:
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--url URL` | `OPENAI_BASE_URL` | NVIDIA NIM | Remote API base URL |
+| `--url URL` | `OPENAI_BASE_URL` | _(none for `--serve`)_ | Remote API base URL; if omitted for `--serve`, ooProxy offers stored profile URLs from `~/.ooProxy/keys.json` |
 | `--key KEY` | `OPENAI_API_KEY` | _(none)_ | API key for the remote backend |
 | `-H, --host HOST` | — | `127.0.0.1` | Local address to bind |
 | `--port PORT` | — | `11434` | Local port to listen on |
@@ -98,6 +98,8 @@ Global flags available to all CLI commands:
 
 If `--key` and `OPENAI_API_KEY` are both omitted, ooProxy looks up a stored key in `~/.ooProxy/keys.json` using the host portion of the remote URL.
 
+When `--serve` is started without `--url`, ooProxy scans the shipped `endpoints/*.json` profiles and offers the profiled URLs whose host or host:port already has a stored key. If no profiled stored endpoint is available, `--serve` exits and asks for `--url` explicitly.
+
 ---
 
 ### List available models
@@ -108,19 +110,19 @@ python ooproxy.py --list \
     --key nvapi-YOUR_KEY_HERE
 ```
 
-Stored keys are also used by `--list`, so this works after the `ollama_keys.py` step above:
+Stored profiled endpoints are also used by `--list`, so this works after the `ooproxy_keys.py` step above:
 
 ```bash
-python ooproxy.py --list --url https://integrate.api.nvidia.com/v1
+python ooproxy.py --list
 ```
 
 ### Manage stored API keys
 
 ```bash
-python tools/ollama_keys.py --host integrate.api.nvidia.com --key nvapi-YOUR_KEY_HERE
-python tools/ollama_keys.py --host integrate.api.nvidia.com
-python tools/ollama_keys.py
-python tools/ollama_keys.py --host integrate.api.nvidia.com --delete
+python tools/ooproxy_keys.py --host integrate.api.nvidia.com --key nvapi-YOUR_KEY_HERE
+python tools/ooproxy_keys.py --host integrate.api.nvidia.com
+python tools/ooproxy_keys.py
+python tools/ooproxy_keys.py --host integrate.api.nvidia.com --delete
 ```
 
 Keys are stored in `~/.ooProxy/keys.json`. The value is only weakly obfuscated using the endpoint string itself, so this avoids casual shoulder-surfing rather than providing strong cryptographic protection.
@@ -147,7 +149,7 @@ ooProxy uses `~/.ooProxy/` as its main global state directory. This is where sha
 
 - `~/.ooProxy/keys.json` for stored API keys
 - `~/.ooProxy/behavior.json` for learned per-model backend quirks
-- `~/.ooProxy/sessions/` for resumable `ollama_chat.py` sessions
+- `~/.ooProxy/sessions/` for resumable `ooproxy_chat.py` sessions
 - `~/.ooProxy/tools/*.json` for your default tool definitions
 
 You can also create a repo-local `.ooProxy/` folder inside an individual project when you want project-specific tools or related helper files. In practice, the important path today is `./.ooProxy/tools/*.json`.
@@ -160,9 +162,9 @@ Tool definitions are discovered in this order:
 
 Later definitions win, so a project-local tool overrides a global tool, and an explicit `-t` file overrides both. This makes `~/.ooProxy/` the shared default and `./.ooProxy/` the per-project override layer.
 
-### ollama_chat CLI
+### ooproxy_chat CLI
 
-`tools/ollama_chat.py` supports built-in tools plus additional external tools loaded from JSON files with `-t/--tools`.
+`tools/ooproxy_chat.py` supports built-in tools plus additional external tools loaded from JSON files with `-t/--tools`.
 
 For the external tool-file schema and the process for researching or implementing a new tool definition, see `examples/tools.md`.
 
@@ -171,15 +173,15 @@ It also keeps resumable per-folder sessions under `~/.ooProxy/sessions/`.
 Example:
 
 ```bash
-python tools/ollama_chat.py llama3.1 -t ./toolset.json
+python tools/ooproxy_chat.py llama3.1 -t ./toolset.json
 ```
 
 Resume or force a fresh session:
 
 ```bash
-python tools/ollama_chat.py llama3.1 --resume SESSION_ID
-python tools/ollama_chat.py llama3.1 --new
-python tools/ollama_chat.py llama3.1 --clean
+python tools/ooproxy_chat.py llama3.1 --resume SESSION_ID
+python tools/ooproxy_chat.py llama3.1 --new
+python tools/ooproxy_chat.py llama3.1 --clean
 ```
 
 By default, tool definition files are discovered in this order:
@@ -229,7 +231,7 @@ Command-backed tools receive the tool arguments on stdin as a JSON object and in
 
 External tool processes also receive `OLLAMA_TOOL_CWD`, so relative paths can resolve against the active chat working directory.
 
-Built-in guardrails are enabled by default in `tools/ollama_chat.py` with `--guardrails confirm-destructive`.
+Built-in guardrails are enabled by default in `tools/ooproxy_chat.py` with `--guardrails confirm-destructive`.
 
 - Read-only built-in tools run automatically.
 - `write_file` asks for confirmation before overwriting an existing path.
@@ -239,9 +241,9 @@ Built-in guardrails are enabled by default in `tools/ollama_chat.py` with `--gua
 Available guardrail modes:
 
 ```bash
-python tools/ollama_chat.py openai/gpt-oss-120b --guardrails confirm-destructive
-python tools/ollama_chat.py openai/gpt-oss-120b --guardrails read-only
-python tools/ollama_chat.py openai/gpt-oss-120b --guardrails off
+python tools/ooproxy_chat.py openai/gpt-oss-120b --guardrails confirm-destructive
+python tools/ooproxy_chat.py openai/gpt-oss-120b --guardrails read-only
+python tools/ooproxy_chat.py openai/gpt-oss-120b --guardrails off
 ```
 
 Other useful options:
@@ -251,7 +253,7 @@ Other useful options:
 - `--render-mode markdown|stream|hybrid` — control how assistant output is rendered in the terminal
 - `-H, --host` / `-P, --port` — point the tool at a different ooProxy or Ollama endpoint
 
-### ollama_chat regression test
+### ooproxy_chat regression test
 
 There is also an end-to-end regression script for the interactive tool-calling flow:
 
@@ -288,8 +290,12 @@ python ooproxy.py -s --url https://api.together.xyz/v1 --key ...
 # Fireworks AI
 python ooproxy.py -s --url https://api.fireworks.ai/inference/v1 --key fw_...
 
-# NVIDIA NIM (default)
+# NVIDIA NIM
 python ooproxy.py -s --url https://integrate.api.nvidia.com/v1 --key nvapi-...
+
+# Or pick from stored endpoint profiles after saving a key
+python tools/ooproxy_keys.py --host integrate.api.nvidia.com --key nvapi-...
+python ooproxy.py -s
 
 # Local Ollama used as the upstream backend
 python ooproxy.py -s --url http://localhost:11434/v1
@@ -418,9 +424,9 @@ modules/
       response.py
       stream.py
 tools/
-  ollama_chat.py        # Interactive chat CLI with tool loading and sessions
-  ollama_keys.py        # Manage ~/.ooProxy/keys.json
-  ollama_list_models.py # Query model lists from an Ollama-compatible endpoint
+  ooproxy_chat.py        # Interactive chat CLI with tool loading and sessions
+  ooproxy_keys.py        # Manage ~/.ooProxy/keys.json
+  ooproxy_list_models.py # Query model lists from an Ollama-compatible endpoint
 ```
 
 ---

@@ -1,7 +1,9 @@
 {
   "id": "openrouter",
   "match": {
+    "schemes": ["https"],
     "host_equals": ["openrouter.ai"],
+    "ports": [443],
     "path_prefixes": ["/api/v1", "/v1"]
   },
   "models": {
