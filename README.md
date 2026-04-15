@@ -39,7 +39,7 @@ pip install -r requirements.txt
 ## Setup
 
 ```bash
-git clone https://github.com/youruser/ooProxy.git
+git clone https://github.com/MockbaTheBorg/ooProxy.git
 cd ooProxy
 python -m venv venv
 source venv/bin/activate
@@ -140,6 +140,25 @@ JSON output:
 ```bash
 python ooproxy.py --list --json
 ```
+
+### Global and project-local `.ooProxy` folders
+
+ooProxy uses `~/.ooProxy/` as its main global state directory. This is where shared data lives across all projects, including:
+
+- `~/.ooProxy/keys.json` for stored API keys
+- `~/.ooProxy/behavior.json` for learned per-model backend quirks
+- `~/.ooProxy/sessions/` for resumable `ollama_chat.py` sessions
+- `~/.ooProxy/tools/*.json` for your default tool definitions
+
+You can also create a repo-local `.ooProxy/` folder inside an individual project when you want project-specific tools or related helper files. In practice, the important path today is `./.ooProxy/tools/*.json`.
+
+Tool definitions are discovered in this order:
+
+- `~/.ooProxy/tools/*.json`
+- `./.ooProxy/tools/*.json`
+- Any files passed explicitly with `-t/--tools`
+
+Later definitions win, so a project-local tool overrides a global tool, and an explicit `-t` file overrides both. This makes `~/.ooProxy/` the shared default and `./.ooProxy/` the per-project override layer.
 
 ### ollama_chat CLI
 
@@ -351,23 +370,56 @@ The model-management endpoints return no-op success responses so Ollama-oriented
 
 ## Project structure
 
-```
-ooproxy.py              # CLI host — discovers and dispatches to modules/
-cli_contract.py         # Module protocol (ModuleSpec, ResultEnvelope, …)
+```text
+.gitignore
+LICENSE
+ooproxy.py
+cli_contract.py
+README.md
 requirements.txt
+endpoints/
+  endpoints.md          # Endpoint profile format and notes
+  fireworks_ai.json
+  local_ollama.json
+  nvidia_nim.json
+  openrouter.json
+  together_ai.json
+examples/
+  my_tools.json
+  tools.md
+  tui_qr.json
+  tui_qr.py
 modules/
-  serve.py              # -s/--serve  start the proxy server
-  list.py               # -l/--list   list remote models
-  _server/              # Internal server package (not exposed as CLI modules)
-    app.py              # FastAPI application factory
-    endpoint_profiles.py # Static endpoint profile loading and matching
-    client.py           # Async HTTP client for the remote backend
-    config.py           # ProxyConfig (URL, key, port)
-    handlers/           # Route handlers for each Ollama endpoint
-    translate/          # Ollama ↔ OpenAI request/response translation
+  __init__.py
+  list.py               # -l/--list
+  serve.py              # -s/--serve
+  _server/
+    __init__.py
+    app.py
+    behavior.py
+    client.py
+    config.py
+    endpoint_profiles.py
+    key_store.py
+    upstream_errors.py
+    handlers/
+      __init__.py
+      chat.py
+      embeddings.py
+      generate.py
+      models.py
+      openai_compat.py
+      stubs.py
+      version.py
+    translate/
+      __init__.py
+      models.py
+      request.py
+      response.py
+      stream.py
 tools/
-  ollama_chat.py        # Interactive chat CLI with resumable sessions and local tools
-  ollama_keys.py        # Store/list/delete API keys in ~/.ooProxy/keys.json
+  ollama_chat.py        # Interactive chat CLI with tool loading and sessions
+  ollama_keys.py        # Manage ~/.ooProxy/keys.json
   ollama_list_models.py # Query model lists from an Ollama-compatible endpoint
 ```
 
