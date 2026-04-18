@@ -4,7 +4,7 @@
     "schemes": ["https"],
     "host_equals": ["api.z.ai"],
     "ports": [443],
-    "path_prefixes": ["/api/paas/v4"]
+    "path_prefixes": ["/api/coding/paas/v4/"]
   },
   "models": {
     "method": "GET",
