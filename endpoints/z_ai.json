@@ -18,6 +18,7 @@
     "path": "chat/completions",
     "streaming": "sse",
     "tools": "supported",
-    "system_prompt": "supported"
+    "system_prompt": "supported",
+    "ttfb_timeout": 90
   }
 }

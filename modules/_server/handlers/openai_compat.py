@@ -825,6 +825,8 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
     behavior = getattr(request.app.state, "behavior", None)
     base_url = getattr(request.app.state, "base_url", "")
     endpoint_profile = getattr(request.app.state, "endpoint_profile", None)
+    # Allow per-endpoint override of the TTFB timeout; fall back to module default
+    ttfb_timeout = _TTFB_TIMEOUT if (endpoint_profile is None or getattr(endpoint_profile, "ttfb_timeout", None) is None) else endpoint_profile.ttfb_timeout
     streaming = body.get("stream", False)
     model = body.get("model", "?")
 
@@ -869,7 +871,7 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
                     base_url=base_url,
                     endpoint_profile=endpoint_profile,
                 ),
-                timeout=_TTFB_TIMEOUT,
+                timeout=ttfb_timeout,
             )
         except asyncio.TimeoutError:
             # Server accepted the connection but never sent response headers — this
@@ -877,7 +879,7 @@ async def v1_chat_handler(request: Request) -> StreamingResponse | JSONResponse:
             # plain non-streaming request and wrap the reply in a synthetic stream.
             logger.warning(
                 "v1 TTFB timeout (>%.0fs) model=%s — falling back to non-streaming",
-                _TTFB_TIMEOUT, model,
+                ttfb_timeout, model,
             )
             fallback = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
             fallback["stream"] = False

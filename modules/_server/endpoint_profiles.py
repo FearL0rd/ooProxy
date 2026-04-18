@@ -70,6 +70,8 @@ class EndpointProfile:
     chat_streaming: str = "sse"
     chat_tools: str = "trial"
     chat_system_prompt: str = "supported"
+    # Seconds to wait for first streaming byte (TTFB). If None, use global default.
+    ttfb_timeout: float | None = None
     health_mode: str = "internal-ready"
     health_path: str | None = None
     health_method: str = "GET"
@@ -102,6 +104,14 @@ def _profile_from_json(path: Path, raw: dict[str, Any]) -> EndpointProfile:
     chat = raw.get("chat") if isinstance(raw.get("chat"), dict) else {}
     health = raw.get("health") if isinstance(raw.get("health"), dict) else {}
     behavior = raw.get("behavior") if isinstance(raw.get("behavior"), dict) else {}
+    # parse optional ttfb_timeout from chat section
+    ttfb_timeout_val = None
+    if "ttfb_timeout" in chat:
+        try:
+            ttfb_timeout_val = float(chat.get("ttfb_timeout"))
+        except (TypeError, ValueError):
+            ttfb_timeout_val = None
+
     return EndpointProfile(
         id=str(raw.get("id") or path.stem),
         source_path=str(path),
@@ -139,6 +149,7 @@ def _profile_from_json(path: Path, raw: dict[str, Any]) -> EndpointProfile:
         chat_streaming=str(chat.get("streaming") or "sse").strip().lower(),
         chat_tools=str(chat.get("tools") or "trial").strip().lower(),
         chat_system_prompt=str(chat.get("system_prompt") or "supported").strip().lower(),
+        ttfb_timeout=ttfb_timeout_val,
         health_mode=str(health.get("mode") or "internal-ready"),
         health_path=str(health.get("path")) if health.get("path") else None,
         health_method=str(health.get("method") or "GET").upper(),

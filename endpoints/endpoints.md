@@ -68,7 +68,8 @@ All supported top-level items are shown below. Any omitted item falls back to th
     "path": "chat/completions",
     "streaming": "sse",
     "tools": "trial",
-    "system_prompt": "supported"
+    "system_prompt": "supported",
+    "ttfb_timeout": 30
   },
   "behavior": {
     "strip_stream_options": true,
@@ -376,6 +377,19 @@ Normalization currently means:
 - Collapse adjacent messages with the same role
 
 Use a normalization value when the provider or model rejects system-role messages or needs simplified role formatting.
+
+#### `chat.ttfb_timeout`
+
+- Type: number (seconds)
+- Required: no
+- Default: 30 (seconds)
+- Purpose: maximum seconds to wait for the first streaming byte (response headers) when issuing a streaming (`stream=true`) request. If the upstream accepts the connection but does not send response headers within this interval, ooProxy will fall back to a non-streaming request and synthesize a streamed response.
+
+Practical guidance:
+
+- Set this to a lower value for backends that are known to respond quickly over SSE.
+- Set this to a higher value for backends that may take longer to start streaming but do eventually send events.
+- Omit the field to use the global default (30s).
 
 ### `behavior`
 
