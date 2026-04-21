@@ -19,9 +19,10 @@ An endpoint descriptor answers two questions:
 
 All supported top-level items are shown below. Any omitted item falls back to the runtime defaults documented in this file.
 
-```json
+```
 {
   "id": "provider_name",
+  "cache_ttl": 1800, // Optional: cache model list requests for 1800 seconds (30 min)
   "match": {
     "schemes": ["https"],
     "host_equals": ["api.example.com"],
@@ -30,6 +31,32 @@ All supported top-level items are shown below. Any omitted item falls back to th
     "path_prefixes": ["/v1"]
   },
   "models": {
+    "cache_ttl": 1800, // Optional: can also specify cache_ttl here (overrides root)
+    ## Request Caching
+
+    You can enable and configure caching for model list requests by adding a `cache_ttl` field (in seconds) to the root or `models` section of the endpoint descriptor. The default is 1800 seconds (30 minutes) if not specified. Example:
+
+    ```json
+    {
+      "id": "my_endpoint",
+      "cache_ttl": 600,
+      ...
+    }
+    ```
+
+    or inside the models section:
+
+    ```json
+    {
+      "id": "my_endpoint",
+      "models": {
+        "cache_ttl": 600,
+        ...
+      }
+    }
+    ```
+
+    When enabled, the first model list request is cached and subsequent requests within the TTL are served from cache. A log message is emitted on cache hits. The cache is in-memory and per-process.
     "method": "GET",
     "path": "models",
     "format": "openai",

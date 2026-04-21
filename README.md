@@ -21,7 +21,24 @@ VS Code Copilot Chat
   (NVIDIA NIM, OpenAI, Groq, …)
 ```
 
+
 ooProxy listens on `localhost:11434` and exposes native local model-server endpoints used by some clients (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/embeddings`, `/api/ps`) plus OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`, `/v1/responses`) and an Anthropic-compatible bridge at `/v1/messages`. It translates requests to OpenAI format where needed, forwards them to the configured remote backend, and translates the responses back — including streaming.
+
+---
+
+## Request Caching
+
+ooProxy implements a general-purpose in-memory request cache for certain endpoints, starting with model list requests (`/api/tags`, `/api/ps`).
+
+- The first model list request for a given endpoint is cached in memory.
+- Subsequent requests within the cache TTL are served from cache (with a log message indicating a cache hit).
+- The default cache expiration is 30 minutes (1800 seconds).
+- The cache TTL can be configured per endpoint in the endpoint descriptor file using the `cache_ttl` field (either at the root or inside the `models` section).
+- The cache is per-process and per-endpoint.
+
+This system is designed to be extensible for caching other request types in the future.
+
+See `endpoints/endpoints.md` for details on configuring endpoint descriptors.
 
 ---
 

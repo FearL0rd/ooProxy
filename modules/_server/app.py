@@ -137,6 +137,9 @@ async def _readyz(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 def create_app(config: ProxyConfig) -> FastAPI:
+
+    from modules._server.request_cache import RequestCache
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if config.cascade is None:
@@ -150,6 +153,7 @@ def create_app(config: ProxyConfig) -> FastAPI:
             app.state.endpoint_profile = None
             app.state.behavior = None
         app.state.responses_store = {}      # explicit — avoids lazy init scattered in handlers
+        app.state.request_cache = RequestCache()
         yield
         aclose = getattr(app.state.client, "aclose", None)
         if callable(aclose):

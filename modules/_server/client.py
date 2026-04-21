@@ -14,6 +14,14 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin
 
 import httpx
+import sys
+
+# ANSI color codes for terminals that support color
+_BLUE = "\033[34m"
+_GREEN = "\033[32m"
+_RESET = "\033[0m"
+# Detect whether stderr is a TTY (logging.StreamHandler defaults to stderr)
+_USE_COLOR = bool(getattr(sys.stderr, "isatty", lambda: False)())
 
 # Optional Prometheus metrics: use if available, otherwise fall back to in-process counters
 _PROMETHEUS_AVAILABLE = True
@@ -128,30 +136,157 @@ def _backoff_delay(attempt: int, response: httpx.Response | None = None) -> floa
 # ---------------------------------------------------------------------------
 
 def _log_body(direction: str, body: dict) -> None:
-    # Prepare a compact preview of the JSON body
-    try:
-        raw = json.dumps(body, ensure_ascii=False)
-    except Exception:
-        # Fallback to string conversion if JSON serialization fails
-        raw = str(body)
-    preview = raw[:600] + ("…" if len(raw) > 600 else "")
-
     # In DEBUG mode keep the original verbose debug output
     if logger.isEnabledFor(logging.DEBUG):
+        try:
+            raw = json.dumps(body, ensure_ascii=False)
+        except Exception:
+            raw = str(body)
+        preview = raw[:600] + ("…" if len(raw) > 600 else "")
         logger.debug("upstream %s %s", direction, preview)
         return
 
     # In INFO (verbose) mode show concise, user-friendly messages
     if logger.isEnabledFor(logging.INFO):
         if direction == "→":
-            logger.info("prompt sent: %s", preview)
+            prompt = _extract_prompt_from_body(body)
+            if _USE_COLOR and prompt:
+                prompt = f"{_BLUE}{prompt}{_RESET}"
+            logger.info("prompt sent: %s", prompt)
         else:
-            logger.info("answer received: %s", preview)
+            answer = _extract_answer_from_payload(body)
+            if answer:
+                if _USE_COLOR:
+                    answer = f"{_GREEN}{answer}{_RESET}"
+                logger.info("answer received: %s", answer)
+            else:
+                try:
+                    raw = json.dumps(body, ensure_ascii=False)
+                except Exception:
+                    raw = str(body)
+                preview = raw[:200] + ("…" if len(raw) > 200 else "")
+                if _USE_COLOR:
+                    preview = f"{_GREEN}{preview}{_RESET}"
+                logger.info("answer received: %s", preview)
 
 
 def _preview_text(text: str, limit: int = 600) -> str:
     compact = text.replace("\r", "\\r").replace("\n", "\\n")
     return compact[:limit] + ("…" if len(compact) > limit else "")
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif isinstance(block.get("text"), str):
+                    parts.append(block.get("text"))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts).strip()
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content.get("text").strip()
+        if isinstance(content.get("content"), str):
+            return content.get("content").strip()
+        for key in ("parts", "segments"):
+            val = content.get(key)
+            if isinstance(val, list):
+                parts = [p for p in val if isinstance(p, str)]
+                if parts:
+                    return "\n".join(parts).strip()
+    return ""
+
+
+def _extract_prompt_from_body(body) -> str:
+    """Try to find the concise prompt text a model will see from a request body.
+
+    Prefers the last user message for chat-style bodies, then keys like
+    `prompt`/`input`/`inputs`. Falls back to a short JSON preview.
+    """
+    if not isinstance(body, dict):
+        return _preview_text(str(body), limit=200)
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for item in reversed(messages):
+            if not isinstance(item, dict):
+                continue
+            if item.get("role") == "user":
+                text = _content_to_text(item.get("content"))
+                if text:
+                    return _preview_text(text, limit=600)
+
+    for key in ("prompt", "input", "inputs"):
+        if key in body:
+            val = body.get(key)
+            if key == "inputs" and isinstance(val, list) and val:
+                val = val[0]
+            text = _content_to_text(val)
+            if text:
+                return _preview_text(text, limit=600)
+
+    # Fallback: try to extract any text-like field from messages
+    if isinstance(messages, list):
+        for item in reversed(messages):
+            if isinstance(item, dict):
+                for candidate in (item.get("content"), item.get("text"), item.get("prompt"), item.get("input")):
+                    text = _content_to_text(candidate)
+                    if text:
+                        return _preview_text(text, limit=600)
+
+    try:
+        raw = json.dumps(body, ensure_ascii=False)
+    except Exception:
+        raw = str(body)
+    return raw[:200] + ("…" if len(raw) > 200 else "")
+
+
+def _extract_answer_from_payload(payload) -> str:
+    """Try to extract a short assistant text from a non-streaming response payload."""
+    if isinstance(payload, str):
+        return _preview_text(payload, limit=600)
+    if not isinstance(payload, dict):
+        try:
+            raw = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            raw = str(payload)
+        return _preview_text(raw, limit=600)
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            msg = first.get("message") or first.get("delta") or first
+            if isinstance(msg, dict):
+                content = msg.get("content") or msg.get("text") or msg.get("value")
+                text = _content_to_text(content)
+                if text:
+                    return _preview_text(text, limit=600)
+            if isinstance(first.get("text"), str):
+                return _preview_text(first.get("text"), limit=600)
+
+    for key in ("output", "outputs", "text", "response", "result"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return _preview_text(val.strip(), limit=600)
+        if isinstance(val, list) and val and isinstance(val[0], str):
+            return _preview_text(val[0], limit=600)
+        if isinstance(val, dict):
+            cont = val.get("content") or val.get("text")
+            if isinstance(cont, str) and cont.strip():
+                return _preview_text(cont.strip(), limit=600)
+
+    try:
+        raw = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        raw = str(payload)
+    return _preview_text(raw, limit=600)
 
 
 def _log_stream_line(line: str | bytes) -> None:
