@@ -107,9 +107,45 @@ async def show_handler(request: Request) -> JSONResponse:
     body = await request.json()
     model_id = body.get("model") or body.get("name", "")
     client = request.app.state.client
+    cache = getattr(request.app.state, "request_cache", None)
+    base_url = getattr(request.app.state, "base_url", None)
+    endpoint_id = None
+    cache_ttl = 1800
+    if base_url:
+        profile = resolve_endpoint_profile(base_url)
+        if profile:
+            endpoint_id = profile.id
+            ttl_val = None
+            if "cache_ttl" in profile.raw:
+                ttl_val = profile.raw["cache_ttl"]
+            elif "cache_ttl" in (profile.raw.get("models") or {}):
+                ttl_val = profile.raw["models"]["cache_ttl"]
+            try:
+                if ttl_val is not None:
+                    cache_ttl = int(ttl_val)
+            except Exception:
+                pass
+    if not endpoint_id:
+        endpoint_id = str(base_url or "default")
+    # Use the same cache key as other model list requests
+    if cache:
+        cached = cache.get(endpoint_id, "model_list")
+        if cached is not None:
+            logger.info("[cache] Served model list for endpoint '%s' from cache (show_handler)", endpoint_id)
+            entry = next(
+                (
+                    candidate
+                    for candidate in cached.get("data", [])
+                    if isinstance(candidate, dict) and candidate.get("id") == model_id
+                ),
+                None,
+            )
+            return JSONResponse(openai_model_to_ollama_show(model_id, entry=entry))
     entry = None
     try:
         data = await client.get_models()
+        if cache:
+            cache.set(endpoint_id, "model_list", data, cache_ttl)
         entry = next(
             (
                 candidate
